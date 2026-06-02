@@ -18,6 +18,7 @@ const db = admin.database();
 const showId = "p1_trivia_scoring";
 const uid = "p1_attendee";
 const skippedUid = "p1_skip_attendee";
+const streakUid = "p1_streak_attendee";
 const root = `test/shows/${showId}`;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -60,6 +61,11 @@ async function readResult(activityId, attendeeId = uid) {
   return snap.val();
 }
 
+async function readDiagnostic(activityId, attendeeId = skippedUid) {
+  const snap = await db.ref(`${root}/scoring_diagnostics/${activityId}/${attendeeId}`).get();
+  return snap.val();
+}
+
 function assertScored(kind, result) {
   assert.ok(result, `${kind} result should exist`);
   assert.notEqual(result.scored, false, `${kind} should not be marked skipped`);
@@ -83,6 +89,10 @@ async function main() {
   });
   await db.ref(`${root}/attendees/${skippedUid}`).set({
     display_name: "P1 Skip",
+    current_streak: 0,
+  });
+  await db.ref(`${root}/attendees/${streakUid}`).set({
+    display_name: "P1 Streak",
     current_streak: 0,
   });
 
@@ -145,6 +155,30 @@ async function main() {
     },
     {}
   );
+  await seedActivity(
+    "streak_first",
+    {
+      kind: "multi",
+      question: "First streak question.",
+      options: [
+        { index: 0, text: "Correct" },
+        { index: 1, text: "Wrong" },
+      ],
+    },
+    { correctOptionIndex: 0 }
+  );
+  await seedActivity(
+    "streak_second",
+    {
+      kind: "multi",
+      question: "Second streak question.",
+      options: [
+        { index: 0, text: "Correct" },
+        { index: 1, text: "Wrong" },
+      ],
+    },
+    { correctOptionIndex: 0 }
+  );
 
   await seedResponse("multi", uid, {
     optionIndex: 1,
@@ -203,21 +237,54 @@ async function main() {
   );
   assert.ok(score.breakdown?.trivia > 0, "scoring should update trivia breakdown");
 
+  await db.ref(`${root}/settings/streak_mode`).set("per_round");
+  await seedResponse("streak_first", streakUid, {
+    optionIndex: 0,
+    answeredAt: now + 6,
+    responseTime: 1000,
+    displayName: "P1 Streak",
+  });
+  const firstStreak = await waitFor(
+    "first streak result",
+    () => readResult("streak_first", streakUid),
+    (value) => Boolean(value && value.totalScore === 145 && value.streakMultiplier === 1)
+  );
+  await seedResponse("streak_second", streakUid, {
+    optionIndex: 0,
+    answeredAt: now + 7,
+    responseTime: 1000,
+    displayName: "P1 Streak",
+  });
+  const secondStreak = await waitFor(
+    "second streak result",
+    () => readResult("streak_second", streakUid),
+    (value) => Boolean(value && value.totalScore === 174 && value.streakMultiplier === 1.2)
+  );
+  assert.equal(firstStreak.totalScore, 145);
+  assert.equal(secondStreak.baseScore, 100);
+  assert.equal(secondStreak.speedBonus, 45);
+  assert.equal(secondStreak.totalScore, 174);
+
   const skippedBoolean = await waitFor(
-    "missing boolean skipped result",
-    () => readResult("missing_boolean", skippedUid),
+    "missing boolean diagnostic",
+    () => readDiagnostic("missing_boolean"),
     (value) => Boolean(value && value.scored === false)
   );
   assert.equal(skippedBoolean.reason, "missing_correctOptionIndex");
-  assert.equal(skippedBoolean.totalScore, 0);
+  assert.equal(Object.hasOwn(skippedBoolean, "totalScore"), false);
 
   const skippedFreeform = await waitFor(
-    "missing freeform skipped result",
-    () => readResult("missing_freeform", skippedUid),
+    "missing freeform diagnostic",
+    () => readDiagnostic("missing_freeform"),
     (value) => Boolean(value && value.scored === false)
   );
   assert.equal(skippedFreeform.reason, "missing_acceptableAnswers");
-  assert.equal(skippedFreeform.totalScore, 0);
+  assert.equal(Object.hasOwn(skippedFreeform, "totalScore"), false);
+
+  const skippedBooleanPublicResult = await readResult("missing_boolean", skippedUid);
+  assert.equal(skippedBooleanPublicResult, null, "missing boolean must not write public results");
+  const skippedFreeformPublicResult = await readResult("missing_freeform", skippedUid);
+  assert.equal(skippedFreeformPublicResult, null, "missing freeform must not write public results");
 
   const skippedScoreSnap = await db.ref(`${root}/scores/${skippedUid}`).get();
   assert.equal(skippedScoreSnap.exists(), false, "skipped responses must not create score totals");
@@ -227,10 +294,13 @@ async function main() {
     console.log(`  ${kind} scored: totalScore=${results[kind].totalScore}`);
   }
   console.log(
-    `  missing_boolean skipped: reason=${skippedBoolean.reason}, totalScore=${skippedBoolean.totalScore}`
+    `  missing_boolean diagnostic: reason=${skippedBoolean.reason}, publicResult=false`
   );
   console.log(
-    `  missing_freeform skipped: reason=${skippedFreeform.reason}, totalScore=${skippedFreeform.totalScore}`
+    `  missing_freeform diagnostic: reason=${skippedFreeform.reason}, publicResult=false`
+  );
+  console.log(
+    `  streak per_round: firstTotal=${firstStreak.totalScore}, secondTotal=${secondStreak.totalScore}, secondMultiplier=${secondStreak.streakMultiplier}`
   );
   console.log(`  attendee totalScore=${score.totalScore}, triviaBreakdown=${score.breakdown.trivia}`);
 

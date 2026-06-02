@@ -174,6 +174,7 @@ type TriviaScoringParams = { showId: string; activityId: string; odience: string
 
 type TriviaSkipReason = "missing_correctOptionIndex" | "missing_acceptableAnswers";
 const databaseInstance = "theta-inkwell-448908-g9-default-rtdb";
+// The RTDB emulator only dispatches v2 database triggers in us-central1; deploys keep asia-southeast1.
 const databaseTriggerRegion = process.env.FIREBASE_DATABASE_EMULATOR_HOST ? "us-central1" : "asia-southeast1";
 
 function makeTriviaScoring(namespacePrefix: string) {
@@ -185,7 +186,7 @@ function makeTriviaScoring(namespacePrefix: string) {
     return `${root}/shows/${showId}/${trimmed}`;
   };
 
-  const writeSkippedResult = async (
+  const writeScoringDiagnostic = async (
     database: admin.database.Database,
     showId: string,
     activityId: string,
@@ -193,14 +194,9 @@ function makeTriviaScoring(namespacePrefix: string) {
     reason: TriviaSkipReason,
     answeredAt: number
   ): Promise<void> => {
-    await database.ref(showPath(showId, `results/${activityId}/${odience}`)).set({
+    await database.ref(showPath(showId, `scoring_diagnostics/${activityId}/${odience}`)).set({
       scored: false,
       reason,
-      isCorrect: false,
-      baseScore: 0,
-      speedBonus: 0,
-      streakMultiplier: 1,
-      totalScore: 0,
       answeredAt,
     });
   };
@@ -294,7 +290,7 @@ function makeTriviaScoring(namespacePrefix: string) {
           reason: "missing_correctOptionIndex",
           namespacePrefix: normalizedPrefix,
         });
-        await writeSkippedResult(
+        await writeScoringDiagnostic(
           database,
           showId,
           activityId,
@@ -329,7 +325,7 @@ function makeTriviaScoring(namespacePrefix: string) {
           reason: "missing_acceptableAnswers",
           namespacePrefix: normalizedPrefix,
         });
-        await writeSkippedResult(
+        await writeScoringDiagnostic(
           database,
           showId,
           activityId,
