@@ -5,11 +5,14 @@
   "main": "lib/index.js",
   "scripts": {
     "build": "tsc",
+    "firebase": "firebase",
     "serve": "npm run build && firebase emulators:start --only functions --config ../firebase.json --project theta-inkwell-448908-g9",
     "shell": "npm run build && firebase functions:shell --config ../firebase.json --project theta-inkwell-448908-g9",
     "start": "npm run shell",
     "deploy": "npm run build && firebase deploy --only functions --config ../firebase.json --project theta-inkwell-448908-g9",
-    "logs": "firebase functions:log --config ../firebase.json --project theta-inkwell-448908-g9"
+    "logs": "firebase functions:log --config ../firebase.json --project theta-inkwell-448908-g9",
+    "test:contracts": "npm run build && node --test test/*.test.mjs",
+    "test:scoring": "npm run build && OPENAI_API_KEY= JAVA_HOME=${JAVA_HOME:-/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home} npm run firebase -- emulators:exec --only database,functions --config ../firebase.emulator.json --project theta-inkwell-448908-g9 \"node scripts/trivia-scoring-emulator.mjs\""
   },
   "engines": {
     "node": "20"
@@ -20,6 +23,7 @@
   },
   "devDependencies": {
     "@types/node": "^20.19.27",
+    "firebase-tools": "^15.1.0",
     "typescript": "^5.3.0"
   },
   "private": true

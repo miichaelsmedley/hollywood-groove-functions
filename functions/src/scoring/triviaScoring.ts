@@ -2,16 +2,9 @@ import * as admin from "firebase-admin";
 import { onValueWritten, DataSnapshot, DatabaseEvent } from "firebase-functions/v2/database";
 import { Change } from "firebase-functions/common";
 import { logger } from "firebase-functions/v2";
+import { isTriviaResponsePayload, type TriviaResponseContract } from "./responseContracts";
 
-type TriviaResponse = {
-  optionIndex?: number;
-  answeredAt?: number;
-  responseTime?: number; // milliseconds elapsed since question start
-  displayName?: string;
-  text?: string | null;
-  booleanValue?: boolean;
-  scaleValue?: number;
-};
+type TriviaResponse = TriviaResponseContract;
 
 type TriviaPrivateActivity = {
   trivia?: {
@@ -179,6 +172,11 @@ function resolveTriviaSettings(settings: ShowSettings | null): {
 
 type TriviaScoringParams = { showId: string; activityId: string; odience: string };
 
+type TriviaSkipReason = "missing_correctOptionIndex" | "missing_acceptableAnswers";
+const databaseInstance = "theta-inkwell-448908-g9-default-rtdb";
+// The RTDB emulator only dispatches v2 database triggers in us-central1; deploys keep asia-southeast1.
+const databaseTriggerRegion = process.env.FIREBASE_DATABASE_EMULATOR_HOST ? "us-central1" : "asia-southeast1";
+
 function makeTriviaScoring(namespacePrefix: string) {
   const normalizedPrefix = normalizeNamespacePrefix(namespacePrefix);
   const root = namespaceRoot(normalizedPrefix);
@@ -188,8 +186,27 @@ function makeTriviaScoring(namespacePrefix: string) {
     return `${root}/shows/${showId}/${trimmed}`;
   };
 
+  const writeScoringDiagnostic = async (
+    database: admin.database.Database,
+    showId: string,
+    activityId: string,
+    odience: string,
+    reason: TriviaSkipReason,
+    answeredAt: number
+  ): Promise<void> => {
+    await database.ref(showPath(showId, `scoring_diagnostics/${activityId}/${odience}`)).set({
+      scored: false,
+      reason,
+      answeredAt,
+    });
+  };
+
   return onValueWritten(
-    { ref: `${root}/shows/{showId}/responses/{activityId}/{odience}`, region: "asia-southeast1" },
+    {
+      ref: `${root}/shows/{showId}/responses/{activityId}/{odience}`,
+      instance: databaseInstance,
+      region: databaseTriggerRegion,
+    },
     async (event: DatabaseEvent<Change<DataSnapshot>, TriviaScoringParams>) => {
     const { showId, activityId, odience } = event.params;
     const change = event.data;
@@ -203,10 +220,12 @@ function makeTriviaScoring(namespacePrefix: string) {
       return null;
     }
 
-    const response = change.after.val() as TriviaResponse | null;
-    if (!response || typeof response !== "object") {
+    const rawResponse = change.after.val();
+    if (!isTriviaResponsePayload(rawResponse)) {
+      // Not a trivia response (e.g., dance claim or signup).
       return null;
     }
+    const response = rawResponse as TriviaResponse;
 
     const optionIndexRaw = typeof response.optionIndex === "number" && Number.isFinite(response.optionIndex)
       ? response.optionIndex
@@ -220,11 +239,6 @@ function makeTriviaScoring(namespacePrefix: string) {
     const hasChoice = optionIndexRaw !== null || booleanValue !== null;
     const hasScale = scaleValue !== null;
     const hasFreeform = responseText !== null && responseText.length > 0;
-
-    if (!hasChoice && !hasScale && !hasFreeform) {
-      // Not a trivia response (e.g., dance claim or signup).
-      return null;
-    }
 
     const database = admin.database();
 
@@ -272,8 +286,18 @@ function makeTriviaScoring(namespacePrefix: string) {
         logger.warn("Trivia scoring skipped: missing correctOptionIndex", {
           showId,
           activityId,
+          odience,
+          reason: "missing_correctOptionIndex",
           namespacePrefix: normalizedPrefix,
         });
+        await writeScoringDiagnostic(
+          database,
+          showId,
+          activityId,
+          odience,
+          "missing_correctOptionIndex",
+          answeredAt
+        );
         return null;
       }
       isCorrect = resolvedIndex === correctOptionIndex;
@@ -297,8 +321,18 @@ function makeTriviaScoring(namespacePrefix: string) {
         logger.warn("Trivia scoring skipped: missing acceptableAnswers", {
           showId,
           activityId,
+          odience,
+          reason: "missing_acceptableAnswers",
           namespacePrefix: normalizedPrefix,
         });
+        await writeScoringDiagnostic(
+          database,
+          showId,
+          activityId,
+          odience,
+          "missing_acceptableAnswers",
+          answeredAt
+        );
         return null;
       }
       const questionText = publicActivity?.trivia?.question ?? "";
@@ -351,6 +385,7 @@ function makeTriviaScoring(namespacePrefix: string) {
     // 3) Update running totals
     const displayName = response.displayName ?? attendee.display_name ?? "Guest";
     const tier = attendee.tier_at_checkin;
+    const leaderboardTimestamp = admin.database.ServerValue?.TIMESTAMP ?? Date.now();
 
     await database.ref(showPath(showId, `scores/${odience}`)).transaction((current) => {
       const existing = (current ?? {}) as Record<string, any>;
@@ -363,7 +398,7 @@ function makeTriviaScoring(namespacePrefix: string) {
       return {
         ...existing,
         displayName: existing.displayName ?? displayName,
-        tier: existing.tier ?? tier,
+        tier: existing.tier ?? tier ?? null,
         totalScore: existingTotal + totalScore,
         breakdown: {
           ...breakdown,
@@ -394,7 +429,7 @@ function makeTriviaScoring(namespacePrefix: string) {
       .slice(0, 50);
 
     await database.ref(showPath(showId, "leaderboard")).set({
-      updatedAt: admin.database.ServerValue.TIMESTAMP,
+      updatedAt: leaderboardTimestamp,
       top,
     });
 

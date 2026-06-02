@@ -1,0 +1,22 @@
+{
+  "rules": {
+    "shows": {
+      "$showId": {
+        "scores": {
+          ".indexOn": ["totalScore"]
+        }
+      }
+    },
+    "test": {
+      "shows": {
+        "$showId": {
+          "scores": {
+            ".indexOn": ["totalScore"]
+          }
+        }
+      }
+    },
+    ".read": true,
+    ".write": true
+  }
+}
