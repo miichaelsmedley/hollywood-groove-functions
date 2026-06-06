@@ -19,6 +19,7 @@ export { grantOrganizationRole, revokeOrganizationRole } from "./grantOrganizati
 export { claimMyPendingVenueStaffInvites } from "./claimVenueStaffInvites";
 export { validateTicketScan } from "./validateTicketScan";
 export { refundOrder } from "./refundOrder";
+export { issueCompTicket } from "./issueCompTicket";
 export { searchPrisVenues, importPrisVenue } from "./importPrisVenue";
 export {
   createTicketedShowFromGig,

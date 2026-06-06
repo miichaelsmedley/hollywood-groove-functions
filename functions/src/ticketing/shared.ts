@@ -28,6 +28,13 @@ export type NormalizedTicketHolderInput = TicketHolderInput & {
   holderSmsOptIn: boolean;
 };
 
+export type TicketConsentSource =
+  | "ticket_purchase"
+  | "self_confirm"
+  | "join_show"
+  | "import"
+  | "comp_issue";
+
 export type CreateCheckoutSessionInput = {
   showId: string;
   ticketTypeId: string;
@@ -61,6 +68,7 @@ export type TicketOrderData = {
   buyerUid: string;
   buyerSnapshot: TicketBuyerSnapshot;
   status: string;
+  paymentType?: "stripe" | "comp" | "cash";
   lineItems: Array<{
     ticketTypeId: string;
     name: string;
@@ -316,6 +324,44 @@ export function generateQrToken(): string {
 
 export function hashQrToken(token: string): string {
   return crypto.createHash("sha256").update(token).digest("hex");
+}
+
+export function buildIssuedTicketData(params: {
+  orderId: string;
+  showId: string;
+  sellingFrontId: string;
+  ticketTypeId: string;
+  holder: TicketHolderInput;
+  holderMemberUid: string | null;
+  holderConsentSource: TicketConsentSource;
+}): Record<string, unknown> {
+  const qrToken = generateQrToken();
+  const holderEmailOptIn = params.holder.holderEmailOptIn === true;
+  const holderSmsOptIn = params.holder.holderSmsOptIn === true;
+
+  return {
+    orderId: params.orderId,
+    showId: params.showId,
+    sellingFrontId: params.sellingFrontId,
+    ticketTypeId: params.ticketTypeId,
+    holderName: params.holder.holderName,
+    holderEmail: params.holder.holderEmail,
+    holderPhone: params.holder.holderPhone ?? null,
+    holderEmailOptIn,
+    holderSmsOptIn,
+    holderConsentSource: params.holderConsentSource,
+    holderConsentAt:
+      holderEmailOptIn || holderSmsOptIn
+        ? FieldValue.serverTimestamp()
+        : null,
+    holderMemberUid: params.holderMemberUid,
+    status: "valid",
+    qrToken,
+    qrTokenHash: hashQrToken(qrToken),
+    issuedAt: FieldValue.serverTimestamp(),
+    usedAt: null,
+    usedByStaffUid: null,
+  };
 }
 
 export function releaseOrderReservation(
