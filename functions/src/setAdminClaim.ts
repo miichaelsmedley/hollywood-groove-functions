@@ -15,7 +15,8 @@ const ADMIN_ROLES = new Set<RequiredRoleName>([
 ]);
 
 type SetAdminClaimInput = {
-  targetUid: string;
+  targetUid?: string;
+  email?: string;
   role: RequiredRoleName;
   grant: boolean;
 };
@@ -31,20 +32,41 @@ function readPartialInput(data: unknown): Partial<SetAdminClaimInput> {
     return {};
   }
 
-  const targetUid = typeof data.targetUid === "string" ? data.targetUid : undefined;
+  const targetUid =
+    typeof data.targetUid === "string" ? data.targetUid : undefined;
+  const email = typeof data.email === "string" ? data.email : undefined;
   const role = typeof data.role === "string" && ADMIN_ROLES.has(data.role as RequiredRoleName)
     ? data.role as RequiredRoleName
     : undefined;
   const grant = typeof data.grant === "boolean" ? data.grant : undefined;
 
-  return { targetUid, role, grant };
+  return { targetUid, email, role, grant };
+}
+
+function normaliseEmail(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const email = value.trim().toLowerCase();
+  return email.includes("@") ? email : undefined;
 }
 
 function validateInput(data: unknown): SetAdminClaimInput {
   const partial = readPartialInput(data);
+  const targetUid = partial.targetUid?.trim();
+  const email = normaliseEmail(partial.email);
 
-  if (!partial.targetUid || partial.targetUid.trim().length === 0) {
-    throw new HttpsError("invalid-argument", "targetUid is required.");
+  if (targetUid && email) {
+    throw new HttpsError(
+      "invalid-argument",
+      "Provide either targetUid or email, not both.",
+    );
+  }
+  if (!targetUid && !email) {
+    throw new HttpsError(
+      "invalid-argument",
+      "Provide either targetUid or a valid email.",
+    );
   }
   if (!partial.role) {
     throw new HttpsError("invalid-argument", "role must be a supported admin role.");
@@ -54,10 +76,58 @@ function validateInput(data: unknown): SetAdminClaimInput {
   }
 
   return {
-    targetUid: partial.targetUid.trim(),
+    targetUid,
+    email,
     role: partial.role,
     grant: partial.grant,
   };
+}
+
+async function resolveTargetUser(
+  input: SetAdminClaimInput,
+): Promise<admin.auth.UserRecord> {
+  if (input.targetUid) {
+    try {
+      return await admin.auth().getUser(input.targetUid);
+    } catch (error) {
+      logger.warn("setAdminClaim target user not found by uid", {
+        targetUid: input.targetUid,
+        role: input.role,
+        grant: input.grant,
+        error,
+      });
+      throw new HttpsError("not-found", "Target user does not exist.");
+    }
+  }
+
+  if (!input.email) {
+    throw new HttpsError(
+      "invalid-argument",
+      "Provide either targetUid or a valid email.",
+    );
+  }
+
+  try {
+    return await admin.auth().getUserByEmail(input.email);
+  } catch (error) {
+    const code =
+      typeof error === "object" && error !== null && "code" in error
+        ? String((error as { code?: unknown }).code)
+        : "";
+    if (code === "auth/user-not-found") {
+      throw new HttpsError(
+        "failed-precondition",
+        "Target user must sign in to Hollywood Groove with this email before an admin claim can be changed.",
+      );
+    }
+    logger.error("Could not resolve setAdminClaim target by email", {
+      email: input.email,
+      role: input.role,
+      grant: input.grant,
+      error,
+    });
+    throw new HttpsError("internal", "Could not verify target account.");
+  }
 }
 
 function isBootstrapCaller(token: Record<string, unknown>): boolean {
@@ -82,6 +152,7 @@ async function writeAuditLog(params: {
     actorEmail,
     action: "setAdminClaim",
     targetUid: params.input.targetUid ?? null,
+    targetEmail: params.input.email ?? null,
     role: params.input.role ?? null,
     grant: params.input.grant ?? null,
 	    status: params.status,
@@ -117,25 +188,12 @@ export const setAdminClaim = onCall(
 
       const input = validateInput(request.data);
 
-      let targetUser: admin.auth.UserRecord;
-      try {
-        targetUser = await admin.auth().getUser(input.targetUid);
-      } catch (error) {
-	        await writeAuditLog({
-	          request,
-	          input,
-	          status: "failed",
-	          reason: "target uid not found",
-	        });
-	        auditWritten = true;
-	        logger.warn("setAdminClaim target user not found", {
-          targetUid: input.targetUid,
-          role: input.role,
-          grant: input.grant,
-          error,
-        });
-        throw new HttpsError("not-found", "Target user does not exist.");
-      }
+      const targetUser = await resolveTargetUser(input);
+      const resolvedInput: SetAdminClaimInput = {
+        ...input,
+        targetUid: targetUser.uid,
+        email: targetUser.email?.toLowerCase() ?? input.email,
+      };
 
       const nextClaims = { ...(targetUser.customClaims ?? {}) };
       if (input.grant) {
@@ -144,17 +202,18 @@ export const setAdminClaim = onCall(
         delete nextClaims[input.role];
       }
 
-      await admin.auth().setCustomUserClaims(input.targetUid, nextClaims);
+      await admin.auth().setCustomUserClaims(targetUser.uid, nextClaims);
 	      await writeAuditLog({
 	        request,
-	        input,
+	        input: resolvedInput,
 	        status: "success",
 	      });
 	      auditWritten = true;
 
       logger.info("Admin custom claim updated", {
         actorUid: authRequest.auth.uid,
-        targetUid: input.targetUid,
+        targetUid: targetUser.uid,
+        targetEmail: resolvedInput.email,
         role: input.role,
         grant: input.grant,
       });
