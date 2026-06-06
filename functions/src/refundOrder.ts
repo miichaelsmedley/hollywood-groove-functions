@@ -1,9 +1,9 @@
-// refundOrder — platform-admin full-order refunds.
+// refundOrder — ticketing-admin full-order refunds.
 //
 // This is intentionally narrow for the first live-payments hardening pass:
-// platform admins can refund a paid order in full, and tickets are invalidated
-// server-side. Partial / per-ticket refunds need an order-detail UI so an admin
-// can see exactly which seats/tickets are being touched.
+// platform admins and event admins can refund a paid order in full, and tickets
+// are invalidated server-side. Partial / per-ticket refunds need an order-detail
+// UI so an admin can see exactly which seats/tickets are being touched.
 
 import { FieldValue } from "firebase-admin/firestore";
 import { HttpsError, onCall } from "firebase-functions/v2/https";
@@ -397,7 +397,7 @@ export const refundOrder = onCall(
     secrets: [STRIPE_SECRET_KEY],
   },
   async (request): Promise<RefundOrderResult> => {
-    const authRequest = requireAuth(request, "platform_admin", {
+    const authRequest = requireAuth(request, ["platform_admin", "event_admin"], {
       keyPrefix: "refundOrder",
       maxCalls: 10,
       windowMs: 60 * 1000,

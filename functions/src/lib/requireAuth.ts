@@ -1,7 +1,8 @@
 import { HttpsError, CallableRequest } from "firebase-functions/v2/https";
 import { logger } from "firebase-functions/v2";
 
-export type RequiredRole = "platform_admin" | "event_admin" | "venue_manager" | "door_staff" | null;
+export type RequiredRoleName = "platform_admin" | "event_admin" | "venue_manager" | "door_staff";
+export type RequiredRole = RequiredRoleName | readonly RequiredRoleName[] | null;
 
 export type RateLimitOptions = {
   maxCalls?: number;
@@ -77,7 +78,13 @@ export function hasRequiredRole(
   token: Record<string, unknown>,
   requiredRole: Exclude<RequiredRole, null>
 ): boolean {
-  return token[requiredRole] === true;
+  const roles = Array.isArray(requiredRole) ? requiredRole : [requiredRole];
+  return roles.some((role) => token[role] === true);
+}
+
+function formatRequiredRole(requiredRole: Exclude<RequiredRole, null>): string {
+  const roles = Array.isArray(requiredRole) ? requiredRole : [requiredRole];
+  return roles.join(" or ");
 }
 
 export function isAppCheckPresent<T>(request: CallableRequest<T>): boolean {
@@ -117,7 +124,10 @@ export function requireAuth<T>(
   enforceRateLimit(request.auth.uid, rateLimitOptions);
 
   if (requiredRole && !hasRequiredRole(request.auth.token, requiredRole)) {
-    throw new HttpsError("permission-denied", `Missing required role: ${requiredRole}.`);
+    throw new HttpsError(
+      "permission-denied",
+      `Missing required role: ${formatRequiredRole(requiredRole)}.`
+    );
   }
 
   return request as AuthenticatedCallableRequest<T>;

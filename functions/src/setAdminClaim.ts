@@ -2,12 +2,12 @@ import * as admin from "firebase-admin";
 import { ServerValue } from "firebase-admin/database";
 import { logger } from "firebase-functions/v2";
 import { HttpsError, CallableRequest, onCall } from "firebase-functions/v2/https";
-import { requireAuth, RequiredRole, REQUIRE_APP_CHECK } from "./lib/requireAuth";
+import { requireAuth, RequiredRoleName, REQUIRE_APP_CHECK } from "./lib/requireAuth";
 
 const REGION = "asia-southeast1";
 const BOOTSTRAP_ADMIN_EMAIL = "miichael.smedley@gmail.com";
 
-const ADMIN_ROLES = new Set<Exclude<RequiredRole, null>>([
+const ADMIN_ROLES = new Set<RequiredRoleName>([
   "platform_admin",
   "event_admin",
   "venue_manager",
@@ -16,7 +16,7 @@ const ADMIN_ROLES = new Set<Exclude<RequiredRole, null>>([
 
 type SetAdminClaimInput = {
   targetUid: string;
-  role: Exclude<RequiredRole, null>;
+  role: RequiredRoleName;
   grant: boolean;
 };
 
@@ -32,8 +32,8 @@ function readPartialInput(data: unknown): Partial<SetAdminClaimInput> {
   }
 
   const targetUid = typeof data.targetUid === "string" ? data.targetUid : undefined;
-  const role = typeof data.role === "string" && ADMIN_ROLES.has(data.role as Exclude<RequiredRole, null>)
-    ? data.role as Exclude<RequiredRole, null>
+  const role = typeof data.role === "string" && ADMIN_ROLES.has(data.role as RequiredRoleName)
+    ? data.role as RequiredRoleName
     : undefined;
   const grant = typeof data.grant === "boolean" ? data.grant : undefined;
 
