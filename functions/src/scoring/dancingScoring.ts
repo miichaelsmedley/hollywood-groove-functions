@@ -2,13 +2,9 @@ import * as admin from "firebase-admin";
 import { onValueWritten, DataSnapshot, DatabaseEvent } from "firebase-functions/v2/database";
 import { Change } from "firebase-functions/common";
 import { logger } from "firebase-functions/v2";
+import { isDanceClaimResponse, type DanceClaimResponseContract } from "./responseContracts";
 
-type DanceClaimResponse = {
-  type?: string;
-  action?: string;
-  claimedAt?: number;
-  displayName?: string;
-};
+type DanceClaimResponse = DanceClaimResponseContract;
 
 type ShowSettings = {
   dancing_mode?: "per_song" | "interval" | "activity" | "disabled";
@@ -95,15 +91,11 @@ function makeDancingScoring(namespacePrefix: string) {
         return null;
       }
 
-      const response = change.after.val() as DanceClaimResponse | null;
-      if (!response || typeof response !== "object") {
+      const rawResponse = change.after.val();
+      if (!isDanceClaimResponse(rawResponse)) {
         return null;
       }
-
-      const isDanceClaim = response.type === "dance_claim" || response.action === "dance_claim";
-      if (!isDanceClaim) {
-        return null;
-      }
+      const response = rawResponse as DanceClaimResponse;
 
       const claimedAt = numberOrDefault(response.claimedAt, Date.now());
       if (change.before.exists()) {

@@ -2,16 +2,9 @@ import * as admin from "firebase-admin";
 import { onValueWritten, DataSnapshot, DatabaseEvent } from "firebase-functions/v2/database";
 import { Change } from "firebase-functions/common";
 import { logger } from "firebase-functions/v2";
+import { isTriviaResponsePayload, type TriviaResponseContract } from "./responseContracts";
 
-type TriviaResponse = {
-  optionIndex?: number;
-  answeredAt?: number;
-  responseTime?: number; // milliseconds elapsed since question start
-  displayName?: string;
-  text?: string | null;
-  booleanValue?: boolean;
-  scaleValue?: number;
-};
+type TriviaResponse = TriviaResponseContract;
 
 type TriviaPrivateActivity = {
   trivia?: {
@@ -203,10 +196,12 @@ function makeTriviaScoring(namespacePrefix: string) {
       return null;
     }
 
-    const response = change.after.val() as TriviaResponse | null;
-    if (!response || typeof response !== "object") {
+    const rawResponse = change.after.val();
+    if (!isTriviaResponsePayload(rawResponse)) {
+      // Not a trivia response (e.g., dance claim or signup).
       return null;
     }
+    const response = rawResponse as TriviaResponse;
 
     const optionIndexRaw = typeof response.optionIndex === "number" && Number.isFinite(response.optionIndex)
       ? response.optionIndex
@@ -220,11 +215,6 @@ function makeTriviaScoring(namespacePrefix: string) {
     const hasChoice = optionIndexRaw !== null || booleanValue !== null;
     const hasScale = scaleValue !== null;
     const hasFreeform = responseText !== null && responseText.length > 0;
-
-    if (!hasChoice && !hasScale && !hasFreeform) {
-      // Not a trivia response (e.g., dance claim or signup).
-      return null;
-    }
 
     const database = admin.database();
 
@@ -350,7 +340,7 @@ function makeTriviaScoring(namespacePrefix: string) {
 
     // 3) Update running totals
     const displayName = response.displayName ?? attendee.display_name ?? "Guest";
-    const tier = attendee.tier_at_checkin;
+    const tier = attendee.tier_at_checkin ?? null;
 
     await database.ref(showPath(showId, `scores/${odience}`)).transaction((current) => {
       const existing = (current ?? {}) as Record<string, any>;
