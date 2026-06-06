@@ -8,3 +8,24 @@ export { triviaScoring, triviaScoringTest } from "./scoring/triviaScoring";
 export { dancingScoring, dancingScoringTest } from "./scoring/dancingScoring";
 export { allTimeLeaderboard, allTimeLeaderboardTest } from "./scoring/allTimeLeaderboard";
 export { teamScoring, teamScoringTest } from "./scoring/teamScoring";
+export { dailyTriviaAutoScheduler } from "./scheduling/dailyTriviaScheduler";
+export { whoAmI } from "./whoAmI";
+export { setAdminClaim } from "./setAdminClaim";
+export { createCheckoutSession } from "./createCheckoutSession";
+export { stripeWebhook } from "./stripeWebhook";
+export { expireReservations } from "./expireReservations";
+export { grantVenueStaff, revokeVenueStaff } from "./grantVenueStaff";
+export { grantOrganizationRole, revokeOrganizationRole } from "./grantOrganizationRole";
+export { claimMyPendingVenueStaffInvites } from "./claimVenueStaffInvites";
+export { validateTicketScan } from "./validateTicketScan";
+export { refundOrder } from "./refundOrder";
+export { searchPrisVenues, importPrisVenue } from "./importPrisVenue";
+export {
+  createTicketedShowFromGig,
+  createTicketedShowFromPrisGig,
+  listSelfTicketGigs,
+} from "./createTicketedShowFromGig";
+
+// One-time migration endpoint. Export only during Step 8, after whoAmI/setAdminClaim
+// are deployed and the bootstrap account can prove admin claim access.
+// export { migrateAdminsToCustomClaims } from "./migrateAdminsToCustomClaims";

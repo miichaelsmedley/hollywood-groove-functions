@@ -1,22 +1,27 @@
 {
   "name": "hollywood-groove-functions",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Firebase Cloud Functions for Hollywood Groove scoring and engagement",
   "main": "lib/index.js",
   "scripts": {
     "build": "tsc",
-    "serve": "npm run build && firebase emulators:start --only functions --config ../firebase.json --project theta-inkwell-448908-g9",
-    "shell": "npm run build && firebase functions:shell --config ../firebase.json --project theta-inkwell-448908-g9",
+    "firebase": "../../hollywood-groove-app/node_modules/.bin/firebase",
+    "serve": "npm run build && JAVA_HOME=${JAVA_HOME:-/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home} npm run firebase -- emulators:start --only functions,auth,database,firestore --config ../../firebase.json --project theta-inkwell-448908-g9",
+    "shell": "npm run build && npm run firebase -- functions:shell --config ../firebase.json --project theta-inkwell-448908-g9",
     "start": "npm run shell",
-    "deploy": "npm run build && firebase deploy --only functions --config ../firebase.json --project theta-inkwell-448908-g9",
-    "logs": "firebase functions:log --config ../firebase.json --project theta-inkwell-448908-g9"
+    "deploy": "npm run build && npm run firebase -- deploy --only functions --config ../firebase.json --project theta-inkwell-448908-g9",
+    "logs": "npm run firebase -- functions:log --config ../firebase.json --project theta-inkwell-448908-g9",
+    "test:contracts": "npm run build && node --test test/*.test.mjs",
+    "phase1:ticketing": "node scripts/phase1-ticketing-emulator.mjs",
+    "phase2:ticketing": "npm run build && node scripts/phase2-stripe-emulator.mjs"
   },
   "engines": {
     "node": "20"
   },
   "dependencies": {
     "firebase-admin": "^12.0.0",
-    "firebase-functions": "^7.0.2"
+    "firebase-functions": "^7.0.2",
+    "stripe": "^22.1.1"
   },
   "devDependencies": {
     "@types/node": "^20.19.27",
