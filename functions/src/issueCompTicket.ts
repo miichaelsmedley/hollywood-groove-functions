@@ -4,15 +4,24 @@ import { getAuth, UserRecord } from "firebase-admin/auth";
 import { HttpsError, onCall } from "firebase-functions/v2/https";
 import { logger } from "firebase-functions/v2";
 import { requireAuth, REQUIRE_APP_CHECK } from "./lib/requireAuth";
-import { getTicketingDb, REGION } from "./ticketing/config";
+import {
+  getTicketWalletUrl,
+  getTicketingDb,
+  REGION,
+  RESEND_API_KEY,
+} from "./ticketing/config";
+import { sendEmail } from "./lib/email/emailService";
+import { compTicketEmail } from "./lib/email/templates";
 import {
   asRecord,
   buildIssuedTicketData,
   nonEmptyString,
   normaliseEmail,
+  TicketOrderData,
   TicketedShowData,
   TicketHolderInput,
   TicketTypeData,
+  timestampMillis,
 } from "./ticketing/shared";
 
 type IssueCompTicketInput = {
@@ -197,6 +206,61 @@ function buildHolders(input: IssueCompTicketInput): TicketHolderInput[] {
   }));
 }
 
+function formatShowStartDateText(value: unknown): string | null {
+  const millis = timestampMillis(value);
+  if (millis <= 0) {
+    return null;
+  }
+  return new Intl.DateTimeFormat("en-AU", {
+    dateStyle: "full",
+    timeStyle: "short",
+    timeZone: "Australia/Melbourne",
+  }).format(new Date(millis));
+}
+
+async function sendCompTicketNotification(
+  result: IssueCompTicketResult,
+): Promise<void> {
+  try {
+    const recipientEmail = normaliseEmail(result.recipientEmail);
+    if (!recipientEmail) {
+      return;
+    }
+
+    const db = getTicketingDb();
+    const [orderSnap, showSnap] = await Promise.all([
+      db.collection("orders").doc(result.orderId).get(),
+      db.collection("shows").doc(result.showId).get(),
+    ]);
+    const order = orderSnap.exists
+      ? (orderSnap.data() as TicketOrderData)
+      : null;
+    const show = showSnap.exists
+      ? (showSnap.data() as TicketedShowData)
+      : null;
+    const template = compTicketEmail({
+      sellingFrontId: order?.sellingFrontId ?? show?.sellingFrontId,
+      recipientName: order?.buyerSnapshot.displayName ?? null,
+      showTitle: show?.title || order?.lineItems[0]?.name || "your show",
+      showStartDateText: formatShowStartDateText(show?.startDate),
+      ticketCount: result.quantity,
+      walletUrl: getTicketWalletUrl(),
+    });
+
+    await sendEmail({
+      to: recipientEmail,
+      subject: template.subject,
+      html: template.html,
+      text: template.text,
+    });
+  } catch (error) {
+    logger.warn("Comp ticket email failed", {
+      orderId: result.orderId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
 function existingResult(
   record: ExistingIdempotencyRecord,
 ): IssueCompTicketResult {
@@ -366,6 +430,8 @@ export async function issueCompTicketAsAdmin(params: {
         buildIssuedTicketData({
           orderId: orderRef.id,
           showId: input.showId,
+          showTitle: show.title ?? null,
+          showStartDate: show.startDate ?? null,
           sellingFrontId: show.sellingFrontId,
           ticketTypeId: input.ticketTypeId,
           holder,
@@ -433,17 +499,25 @@ export const issueCompTicket = onCall(
   {
     region: REGION,
     enforceAppCheck: REQUIRE_APP_CHECK,
+    secrets: [RESEND_API_KEY],
   },
   async (request): Promise<IssueCompTicketResult> => {
     const authRequest = requireAuth(request, ["platform_admin", "event_admin"], {
       keyPrefix: "issueCompTicket",
       maxCalls: 20,
       windowMs: 60 * 1000,
+      requireEmailVerified: true,
     });
 
-    return issueCompTicketAsAdmin({
+    const result = await issueCompTicketAsAdmin({
       actorUid: authRequest.auth.uid,
       data: request.data,
     });
+
+    if (!result.idempotent) {
+      await sendCompTicketNotification(result);
+    }
+
+    return result;
   },
 );

@@ -33,7 +33,8 @@ export type TicketConsentSource =
   | "self_confirm"
   | "join_show"
   | "import"
-  | "comp_issue";
+  | "comp_issue"
+  | "share";
 
 export type CreateCheckoutSessionInput = {
   showId: string;
@@ -67,6 +68,7 @@ export type TicketOrderData = {
   sellingFrontId: string;
   buyerUid: string;
   buyerSnapshot: TicketBuyerSnapshot;
+  buyerEmailVerified?: boolean;
   status: string;
   paymentType?: "stripe" | "comp" | "cash";
   lineItems: Array<{
@@ -329,6 +331,10 @@ export function hashQrToken(token: string): string {
 export function buildIssuedTicketData(params: {
   orderId: string;
   showId: string;
+  // Denormalized show snapshot captured at mint time so the buyer wallet can
+  // render a ticket even if the show doc is later removed/unavailable.
+  showTitle?: string | null;
+  showStartDate?: Timestamp | string | null;
   sellingFrontId: string;
   ticketTypeId: string;
   holder: TicketHolderInput;
@@ -342,6 +348,8 @@ export function buildIssuedTicketData(params: {
   return {
     orderId: params.orderId,
     showId: params.showId,
+    showTitle: params.showTitle ?? null,
+    showStartDate: params.showStartDate ?? null,
     sellingFrontId: params.sellingFrontId,
     ticketTypeId: params.ticketTypeId,
     holderName: params.holder.holderName,

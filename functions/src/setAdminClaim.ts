@@ -1,8 +1,14 @@
+import crypto from "node:crypto";
 import * as admin from "firebase-admin";
 import { ServerValue } from "firebase-admin/database";
 import { logger } from "firebase-functions/v2";
-import { HttpsError, CallableRequest, onCall } from "firebase-functions/v2/https";
+import { HttpsError, CallableRequest, onCall, onRequest } from "firebase-functions/v2/https";
 import { requireAuth, RequiredRoleName, REQUIRE_APP_CHECK } from "./lib/requireAuth";
+import {
+  getPrisApiBaseUrl,
+  getPrisIntegrationSecret,
+  PRIS_HOLLYWOOD_GROOVE_INTEGRATION_SECRET,
+} from "./ticketing/config";
 
 const REGION = "asia-southeast1";
 const BOOTSTRAP_ADMIN_EMAIL = "miichael.smedley@gmail.com";
@@ -13,6 +19,38 @@ const ADMIN_ROLES = new Set<RequiredRoleName>([
   "venue_manager",
   "door_staff",
 ]);
+const TICKETING_USER_ROLES = new Set<TicketingUserRole>([
+  "none",
+  "scanner",
+  "ticketer",
+  "ticket_admin",
+  "absolute_admin",
+]);
+const CLAIM_TO_TICKETING_ROLE: Record<RequiredRoleName, TicketingUserRole> = {
+  door_staff: "scanner",
+  venue_manager: "ticketer",
+  event_admin: "ticket_admin",
+  platform_admin: "absolute_admin",
+};
+const TICKETING_ROLE_TO_CLAIM: Record<Exclude<TicketingUserRole, "none">, RequiredRoleName> = {
+  scanner: "door_staff",
+  ticketer: "venue_manager",
+  ticket_admin: "event_admin",
+  absolute_admin: "platform_admin",
+};
+const TICKETING_CLAIMS: RequiredRoleName[] = [
+  "door_staff",
+  "venue_manager",
+  "event_admin",
+  "platform_admin",
+];
+
+type TicketingUserRole =
+  | "none"
+  | "scanner"
+  | "ticketer"
+  | "ticket_admin"
+  | "absolute_admin";
 
 type SetAdminClaimInput = {
   targetUid?: string;
@@ -22,6 +60,12 @@ type SetAdminClaimInput = {
 };
 
 type AuditStatus = "success" | "denied" | "failed";
+type PrisSyncStatus = "updated" | "skipped" | "failed";
+
+type PrisSyncResult = {
+  status: PrisSyncStatus;
+  reason?: string;
+};
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -49,6 +93,33 @@ function normaliseEmail(value: unknown): string | undefined {
   }
   const email = value.trim().toLowerCase();
   return email.includes("@") ? email : undefined;
+}
+
+function normaliseTicketingRole(value: unknown): TicketingUserRole | null {
+  if (typeof value !== "string") return null;
+  const role = value.trim().toLowerCase();
+  return TICKETING_USER_ROLES.has(role as TicketingUserRole)
+    ? role as TicketingUserRole
+    : null;
+}
+
+function ticketingRoleFromClaims(claims: Record<string, unknown>): TicketingUserRole {
+  if (claims.platform_admin === true) return "absolute_admin";
+  if (claims.event_admin === true) return "ticket_admin";
+  if (claims.venue_manager === true) return "ticketer";
+  if (claims.door_staff === true) return "scanner";
+  return "none";
+}
+
+function applyExclusiveTicketingRole(
+  claims: Record<string, unknown>,
+  role: TicketingUserRole,
+): void {
+  for (const claim of TICKETING_CLAIMS) {
+    delete claims[claim];
+  }
+  if (role === "none") return;
+  claims[TICKETING_ROLE_TO_CLAIM[role]] = true;
 }
 
 function validateInput(data: unknown): SetAdminClaimInput {
@@ -161,8 +232,137 @@ async function writeAuditLog(params: {
 	  });
 	}
 
+function secureCompareSecret(
+  provided: string | null,
+  expected: string | null,
+): boolean {
+  if (!provided || !expected) return false;
+  const providedHash = crypto.createHash("sha256").update(provided).digest();
+  const expectedHash = crypto.createHash("sha256").update(expected).digest();
+  return crypto.timingSafeEqual(providedHash, expectedHash);
+}
+
+function extractRequestSecret(request: {
+  get(name: string): string | undefined;
+}): string | null {
+  const headerSecret = request.get("X-PRIS-Integration-Secret")?.trim();
+  if (headerSecret) return headerSecret;
+  const authHeader = request.get("Authorization")?.trim() || "";
+  const bearerMatch = authHeader.match(/^Bearer\s+(.+)$/i);
+  return bearerMatch ? bearerMatch[1].trim() : null;
+}
+
+async function syncPrisTicketingAdminProjection(params: {
+  targetUid: string;
+  email?: string | null;
+  displayName?: string | null;
+  ticketingRole: TicketingUserRole;
+  actorUid: string;
+  actorEmail?: string | null;
+}): Promise<PrisSyncResult> {
+  const email = normaliseEmail(params.email);
+  if (!email) return { status: "skipped", reason: "target_email_missing" };
+
+  const secret = getPrisIntegrationSecret();
+  if (!secret) return { status: "skipped", reason: "pris_secret_missing" };
+
+  try {
+    const response = await fetch(
+      `${getPrisApiBaseUrl()}/api/integrations/hollywood-groove/ticketing-admins`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-PRIS-Integration-Secret": secret,
+        },
+        body: JSON.stringify({
+          email,
+          displayName: params.displayName || null,
+          firebaseUid: params.targetUid,
+          ticketing_role: params.ticketingRole,
+          actorUid: params.actorUid,
+          actorEmail: params.actorEmail || null,
+          source: "hollywood-groove-pwa",
+        }),
+      },
+    );
+
+    const raw = await response.text();
+    let payload: Record<string, unknown> = {};
+    try {
+      payload = raw ? JSON.parse(raw) : {};
+    } catch {
+      payload = {};
+    }
+
+    if (!response.ok) {
+      const reason =
+        typeof payload.error === "string"
+          ? payload.error
+          : raw.slice(0, 120) || `pris_${response.status}`;
+      logger.warn("PRIS ticketing admin projection failed", {
+        email,
+        status: response.status,
+        reason,
+      });
+      return { status: "failed", reason };
+    }
+
+    const outcome =
+      typeof payload.outcome === "string" ? payload.outcome : "updated";
+    return { status: "updated", reason: outcome };
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : "unknown_error";
+    logger.warn("PRIS ticketing admin projection request failed", {
+      email,
+      reason,
+    });
+    return { status: "failed", reason };
+  }
+}
+
+function noteForClaimUpdate(
+  input: SetAdminClaimInput,
+  prisSync: PrisSyncResult | null,
+): string {
+  const base = "claim takes effect after target's ID token refreshes";
+  if (!prisSync) return base;
+  if (prisSync.status === "updated") {
+    return `${base}; PRIS user record updated`;
+  }
+  if (prisSync.status === "skipped") {
+    return `${base}; PRIS sync skipped (${prisSync.reason || "not configured"})`;
+  }
+  return `${base}; PRIS sync failed (${prisSync.reason || "unknown error"})`;
+}
+
+async function writePrisSyncAuditLog(params: {
+  actorEmail?: string | null;
+  targetUid?: string | null;
+  targetEmail?: string | null;
+  ticketingRole?: TicketingUserRole | null;
+  status: AuditStatus;
+  reason?: string;
+}): Promise<void> {
+  await admin.database().ref("audit_log").push({
+    actorUid: "pris-crm",
+    actorEmail: params.actorEmail ?? null,
+    action: "syncTicketingAdminFromPrisUser",
+    targetUid: params.targetUid ?? null,
+    targetEmail: params.targetEmail ?? null,
+    role: params.ticketingRole ?? null,
+    status: params.status,
+    reason: params.reason ?? null,
+    at: ServerValue.TIMESTAMP,
+  });
+}
+
 export const setAdminClaim = onCall(
-  { region: REGION, enforceAppCheck: REQUIRE_APP_CHECK },
+  {
+    region: REGION,
+    enforceAppCheck: REQUIRE_APP_CHECK,
+    secrets: [PRIS_HOLLYWOOD_GROOVE_INTEGRATION_SECRET],
+  },
 	  async (request) => {
 	    const partialInput = readPartialInput(request.data);
 	    let auditWritten = false;
@@ -197,12 +397,20 @@ export const setAdminClaim = onCall(
 
       const nextClaims = { ...(targetUser.customClaims ?? {}) };
       if (input.grant) {
-        nextClaims[input.role] = true;
+        applyExclusiveTicketingRole(nextClaims, CLAIM_TO_TICKETING_ROLE[input.role]);
       } else {
         delete nextClaims[input.role];
       }
 
       await admin.auth().setCustomUserClaims(targetUser.uid, nextClaims);
+      const prisSync = await syncPrisTicketingAdminProjection({
+        targetUid: targetUser.uid,
+        email: resolvedInput.email,
+        displayName: targetUser.displayName || null,
+        ticketingRole: ticketingRoleFromClaims(nextClaims),
+        actorUid: authRequest.auth.uid,
+        actorEmail: authRequest.auth.token.email || null,
+      });
 	      await writeAuditLog({
 	        request,
 	        input: resolvedInput,
@@ -220,7 +428,8 @@ export const setAdminClaim = onCall(
 
       return {
         ok: true,
-        note: "claim takes effect after target's ID token refreshes",
+        note: noteForClaimUpdate(input, prisSync),
+        prisSync,
       };
 	    } catch (error) {
 	      if (error instanceof HttpsError) {
@@ -248,4 +457,105 @@ export const setAdminClaim = onCall(
 	      throw error;
 	    }
   }
+);
+
+export const syncTicketingAdminFromPrisUser = onRequest(
+  {
+    region: REGION,
+    invoker: "public",
+    secrets: [PRIS_HOLLYWOOD_GROOVE_INTEGRATION_SECRET],
+  },
+  async (request, response) => {
+    if (request.method !== "POST") {
+      response
+        .set("Allow", "POST")
+        .status(405)
+        .json({ error: "method_not_allowed" });
+      return;
+    }
+
+    const expectedSecret = getPrisIntegrationSecret();
+    if (!expectedSecret) {
+      response.status(503).json({ error: "integration_secret_not_configured" });
+      return;
+    }
+    if (!secureCompareSecret(extractRequestSecret(request), expectedSecret)) {
+      response.status(401).json({ error: "unauthorized" });
+      return;
+    }
+
+    const body = isRecord(request.body) ? request.body : {};
+    const email = normaliseEmail(body.email);
+    let ticketingRole =
+      normaliseTicketingRole(body.ticketing_role) ||
+      normaliseTicketingRole(body.ticketingRole);
+    if (!ticketingRole) {
+      const legacyGrantValue = body.grant ?? body.ticketing_event_admin;
+      if (typeof legacyGrantValue === "boolean") {
+        ticketingRole = legacyGrantValue ? "ticket_admin" : "none";
+      }
+    }
+    const actorEmail =
+      typeof body.actorEmail === "string" ? body.actorEmail : null;
+
+    if (!email || !ticketingRole) {
+      await writePrisSyncAuditLog({
+        actorEmail,
+        targetEmail: email,
+        ticketingRole,
+        status: "failed",
+        reason: "invalid_request",
+      });
+      response.status(400).json({
+        error: "invalid_request",
+        message: "email and ticketing_role are required.",
+      });
+      return;
+    }
+
+    try {
+      const targetUser = await admin.auth().getUserByEmail(email);
+      const nextClaims = { ...(targetUser.customClaims ?? {}) };
+      applyExclusiveTicketingRole(nextClaims, ticketingRole);
+      await admin.auth().setCustomUserClaims(targetUser.uid, nextClaims);
+      await writePrisSyncAuditLog({
+        actorEmail,
+        targetUid: targetUser.uid,
+        targetEmail: email,
+        ticketingRole,
+        status: "success",
+      });
+      response.json({
+        ok: true,
+        email,
+        targetUid: targetUser.uid,
+        ticketingRole,
+        note: "claim takes effect after target's ID token refreshes",
+      });
+    } catch (error) {
+      const code =
+        typeof error === "object" && error !== null && "code" in error
+          ? String((error as { code?: unknown }).code)
+          : "";
+      const userMissing = code === "auth/user-not-found";
+      const reason = userMissing
+        ? "hollywood_groove_user_not_found"
+        : error instanceof Error
+          ? error.message
+          : "unknown_error";
+      await writePrisSyncAuditLog({
+        actorEmail,
+        targetEmail: email,
+        ticketingRole,
+        status: userMissing ? "denied" : "failed",
+        reason,
+      });
+      response.status(userMissing ? 412 : 500).json({
+        error: reason,
+        message: userMissing
+          ? "This PRIS user must sign in to Hollywood Groove once before ticketing access can be changed."
+          : "Could not update the Hollywood Groove ticketing role.",
+      });
+    }
+  },
 );

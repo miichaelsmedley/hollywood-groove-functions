@@ -1,4 +1,8 @@
 import admin from "firebase-admin";
+import { createHash } from "node:crypto";
+
+const hashEmail = (value) =>
+  createHash("sha256").update(String(value).trim().toLowerCase()).digest("hex");
 
 const PROJECT_ID = process.env.GCLOUD_PROJECT || process.env.GOOGLE_CLOUD_PROJECT || "theta-inkwell-448908-g9";
 const FIRESTORE_EMULATOR_HOST = process.env.FIRESTORE_EMULATOR_HOST || "127.0.0.1:8080";
@@ -46,6 +50,8 @@ const ids = {
   buyerUid: "phase2_buyer",
   adminUid: "phase2_admin",
 };
+
+const SHOW_TITLE = "Hollywood Groove Phase 2 Stripe Test";
 
 function futureDate(minutes) {
   return Timestamp.fromDate(new Date(Date.now() + minutes * 60 * 1000));
@@ -126,7 +132,7 @@ async function seedTicketingConfig() {
   });
 
   batch.set(db.collection("shows").doc(ids.show), {
-    title: "Hollywood Groove Phase 2 Stripe Test",
+    title: SHOW_TITLE,
     sellingFrontId: ids.front,
     startDate: futureDate(60 * 24 * 30),
     venueId: ids.venue,
@@ -170,6 +176,7 @@ async function createCheckout(quantity, holderEmailSuffix = "buyer", sellingFron
       uid: ids.buyerUid,
       email: "phase2-buyer@example.invalid",
       displayName: "Phase 2 Buyer",
+      emailVerified: true,
     },
     data: {
       showId: ids.show,
@@ -238,6 +245,16 @@ async function assertTicketCount(orderId, expectedCount) {
     if (!ticket.qrToken || !ticket.qrTokenHash || ticket.status !== "valid") {
       throw new Error(`invalid ticket payload: ${JSON.stringify(ticket)}`);
     }
+    if (ticket.showTitle !== SHOW_TITLE) {
+      throw new Error(
+        `expected ticket ${doc.id} showTitle ${JSON.stringify(SHOW_TITLE)}, got ${JSON.stringify(ticket.showTitle)}`,
+      );
+    }
+    if (!ticket.showStartDate) {
+      throw new Error(
+        `expected ticket ${doc.id} to carry showStartDate, got ${JSON.stringify(ticket.showStartDate)}`,
+      );
+    }
   }
 }
 
@@ -258,6 +275,43 @@ async function assertRefundCount(orderId, expectedCount) {
   const snap = await db.collection("refunds").where("orderId", "==", orderId).get();
   if (snap.size !== expectedCount) {
     throw new Error(`expected ${expectedCount} refund docs for ${orderId}, got ${snap.size}`);
+  }
+}
+
+// Verified buyer's own ticket binds to their account (no claim record); any
+// other-email holder is left unbound and claimable by email via ticketShareClaims.
+async function assertTicketBinding(orderId) {
+  const snap = await db.collection("tickets").where("orderId", "==", orderId).get();
+  let bound = 0;
+  let claimable = 0;
+  for (const docSnap of snap.docs) {
+    const t = docSnap.data();
+    const claim = await db.collection("ticketShareClaims").doc(docSnap.id).get();
+    const isBuyerEmail =
+      String(t.holderEmail || "").trim().toLowerCase() === "phase2-buyer@example.invalid";
+    if (isBuyerEmail) {
+      if (t.holderMemberUid !== ids.buyerUid) {
+        throw new Error(`verified buyer ticket ${docSnap.id} should bind to buyerUid, got ${t.holderMemberUid}`);
+      }
+      if (claim.exists) {
+        throw new Error(`verified buyer ticket ${docSnap.id} should have no claim record`);
+      }
+      bound += 1;
+    } else {
+      if (t.holderMemberUid) {
+        throw new Error(`other-email ticket ${docSnap.id} should be unbound, got ${t.holderMemberUid}`);
+      }
+      if (!claim.exists) {
+        throw new Error(`other-email ticket ${docSnap.id} should have a ticketShareClaims record`);
+      }
+      if (claim.data().emailHash !== hashEmail(t.holderEmail)) {
+        throw new Error(`claim emailHash mismatch for ticket ${docSnap.id}`);
+      }
+      claimable += 1;
+    }
+  }
+  if (bound !== 1 || claimable !== 1) {
+    throw new Error(`expected 1 bound + 1 claimable ticket, got bound=${bound} claimable=${claimable}`);
   }
 }
 
@@ -320,6 +374,24 @@ async function main() {
   }
   await assertOrderStatus(abandoned.orderId, "cancelled");
   await assertTicketType(0, 0);
+
+  // Guest/friend claimability: a paid 2-ticket order binds the VERIFIED buyer's
+  // own ticket to their account and leaves the friend ticket (different email)
+  // claimable by email via a ticketShareClaims record (the guest-checkout path).
+  const claimOrder = await createCheckout(2, "claimtest");
+  const claimEvent = buildCheckoutCompletedEvent({
+    eventId: "evt_phase2_claimable",
+    orderId: claimOrder.orderId,
+    sessionId: claimOrder.checkoutSessionId,
+    paymentIntentId: "pi_phase2_claimable",
+  });
+  const claimProcessed = await processStripeEvent(claimEvent);
+  if (claimProcessed.status !== "processed") {
+    throw new Error(`expected processed claimable webhook, got ${claimProcessed.status}`);
+  }
+  await assertOrderStatus(claimOrder.orderId, "paid");
+  await assertTicketCount(claimOrder.orderId, 2);
+  await assertTicketBinding(claimOrder.orderId);
 
   console.log(JSON.stringify({
     ok: true,

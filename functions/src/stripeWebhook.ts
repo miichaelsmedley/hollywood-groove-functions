@@ -2,22 +2,36 @@ import { FieldValue, Timestamp } from "firebase-admin/firestore";
 import { logger } from "firebase-functions/v2";
 import { onRequest } from "firebase-functions/v2/https";
 import {
+  getTicketWalletUrl,
   getStripeClient,
   getStripeWebhookSecret,
   getTicketingDb,
   REGION,
   PRIS_HOLLYWOOD_GROOVE_INTEGRATION_SECRET,
+  RESEND_API_KEY,
   STRIPE_SECRET_KEY,
   STRIPE_WEBHOOK_SECRET,
 } from "./ticketing/config";
+import { sendEmail } from "./lib/email/emailService";
+import { ticketReadyEmail } from "./lib/email/templates";
 import {
   generateQrToken,
   hashQrToken,
+  normaliseEmail,
   PromoCodeData,
+  TicketedShowData,
   TicketOrderData,
   TicketTypeData,
+  timestampMillis,
 } from "./ticketing/shared";
 import { syncPrisTicketingPurchase } from "./syncPrisTicketingPurchase";
+import { createHash } from "node:crypto";
+
+// SHA-256 of a normalised email — must match shareTicket/claimMyPendingTickets
+// so a purchased ticket's pending-claim is found by the holder's verified email.
+function hashEmail(email: string): string {
+  return createHash("sha256").update(email.trim().toLowerCase()).digest("hex");
+}
 
 type StripeEvent = {
   id: string;
@@ -63,6 +77,56 @@ type ProcessStripeEventResult = {
   relatedOrderId?: string | null;
   note?: string;
 };
+
+type TicketReadyNotification = {
+  orderId: string;
+  to: string;
+  buyerName?: string | null;
+  sellingFrontId?: string;
+  showTitle: string;
+  showStartDateText: string | null;
+  ticketCount: number;
+};
+
+function formatShowStartDateText(value: unknown): string | null {
+  const millis = timestampMillis(value);
+  if (millis <= 0) {
+    return null;
+  }
+  return new Intl.DateTimeFormat("en-AU", {
+    dateStyle: "full",
+    timeStyle: "short",
+    timeZone: "Australia/Melbourne",
+  }).format(new Date(millis));
+}
+
+async function sendTicketReadyNotification(
+  notification: TicketReadyNotification,
+  eventId: string,
+): Promise<void> {
+  try {
+    const template = ticketReadyEmail({
+      sellingFrontId: notification.sellingFrontId,
+      buyerName: notification.buyerName,
+      showTitle: notification.showTitle,
+      showStartDateText: notification.showStartDateText,
+      ticketCount: notification.ticketCount,
+      walletUrl: getTicketWalletUrl(),
+    });
+    await sendEmail({
+      to: notification.to,
+      subject: template.subject,
+      html: template.html,
+      text: template.text,
+    });
+  } catch (error) {
+    logger.warn("Ticket ready email failed after ticket issue", {
+      orderId: notification.orderId,
+      eventId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
 
 function readStripeObjectId(value: unknown): string | null {
   if (typeof value === "string") {
@@ -170,6 +234,7 @@ async function issueTicketsForPaidOrder(
   session: StripeCheckoutSession,
 ): Promise<ProcessStripeEventResult> {
   const db = getTicketingDb();
+  let ticketReadyNotification: TicketReadyNotification | null = null;
   const orderId = getOrderIdFromStripeObject(session);
   if (!orderId) {
     return recordStripeEvent({
@@ -184,6 +249,7 @@ async function issueTicketsForPaidOrder(
 
   const result: ProcessStripeEventResult = await db.runTransaction(
     async (tx): Promise<ProcessStripeEventResult> => {
+      ticketReadyNotification = null;
       const [eventSnap, orderSnap] = await Promise.all([
         tx.get(eventRef),
         tx.get(orderRef),
@@ -250,12 +316,14 @@ async function issueTicketsForPaidOrder(
 
       const lineItem = order.lineItems[0];
       const quantity = lineItem.quantity;
-      const ticketTypeRef = db
-        .collection("shows")
-        .doc(order.showId)
+      const showRef = db.collection("shows").doc(order.showId);
+      const ticketTypeRef = showRef
         .collection("ticketTypes")
         .doc(lineItem.ticketTypeId);
-      const ticketTypeSnap = await tx.get(ticketTypeRef);
+      const [showSnap, ticketTypeSnap] = await Promise.all([
+        tx.get(showRef),
+        tx.get(ticketTypeRef),
+      ]);
       if (!ticketTypeSnap.exists) {
         tx.set(eventRef, {
           type: event.type,
@@ -274,6 +342,16 @@ async function issueTicketsForPaidOrder(
       }
 
       const ticketType = ticketTypeSnap.data() as TicketTypeData;
+      // Denormalized show snapshot stamped onto each ticket so the buyer wallet
+      // can still render it if the show doc is later deleted/unavailable. A
+      // missing show (e.g. removed after payment) must never block minting an
+      // already-paid order, so fall back to null.
+      const show = showSnap.exists
+        ? (showSnap.data() as TicketedShowData)
+        : null;
+      const showTitle = show?.title ?? null;
+      const showStartDate = show?.startDate ?? null;
+      const buyerEmail = normaliseEmail(order.buyerSnapshot.email);
       const promoCodeId = order.promoCode?.id;
       const promoRef = promoCodeId
         ? db
@@ -296,6 +374,17 @@ async function issueTicketsForPaidOrder(
               holderEmailOptIn: false,
               holderSmsOptIn: false,
             }));
+      if (buyerEmail) {
+        ticketReadyNotification = {
+          orderId,
+          to: buyerEmail,
+          buyerName: order.buyerSnapshot.displayName ?? null,
+          sellingFrontId: order.sellingFrontId,
+          showTitle: showTitle || lineItem.name || "your show",
+          showStartDateText: formatShowStartDateText(showStartDate),
+          ticketCount: quantity,
+        };
+      }
       const reserved = Number(ticketType.quantityReserved ?? 0);
       const sold = Number(ticketType.quantitySold ?? 0);
       const paymentIntentId = readStripeObjectId(session.payment_intent);
@@ -336,12 +425,26 @@ async function issueTicketsForPaidOrder(
         },
       );
 
+      // Bind a ticket to the buyer's account ONLY when they're a verified
+      // signed-in account buying for their own email. Guest-checkout tickets
+      // (anonymous buyer) and tickets bought for someone else's email are left
+      // unbound and made claimable by email via a ticketShareClaims record, so
+      // the holder claims them after signing in (claimMyPendingTickets).
+      const buyerVerified = order.buyerEmailVerified === true;
+      const buyerEmailNorm = normaliseEmail(order.buyerSnapshot.email);
       holders.forEach((holder) => {
         const ticketRef = db.collection("tickets").doc();
         const qrToken = generateQrToken();
+        const holderEmailNorm = normaliseEmail(holder.holderEmail);
+        const boundUid =
+          buyerVerified && holderEmailNorm && holderEmailNorm === buyerEmailNorm
+            ? order.buyerUid
+            : null;
         tx.set(ticketRef, {
           orderId,
           showId: order.showId,
+          showTitle,
+          showStartDate,
           sellingFrontId: order.sellingFrontId,
           ticketTypeId: lineItem.ticketTypeId,
           holderName: holder.holderName,
@@ -354,10 +457,7 @@ async function issueTicketsForPaidOrder(
             holder.holderEmailOptIn || holder.holderSmsOptIn
               ? FieldValue.serverTimestamp()
               : null,
-          holderMemberUid:
-            holder.holderEmail === order.buyerSnapshot.email
-              ? order.buyerUid
-              : null,
+          holderMemberUid: boundUid,
           status: "valid",
           qrToken,
           qrTokenHash: hashQrToken(qrToken),
@@ -365,6 +465,27 @@ async function issueTicketsForPaidOrder(
           usedAt: null,
           usedByStaffUid: null,
         });
+        // Unbound ticket (guest checkout, or bought for someone else's email)
+        // → make it claimable by the holder's verified email after they sign in.
+        if (!boundUid && holderEmailNorm) {
+          tx.set(db.collection("ticketShareClaims").doc(ticketRef.id), {
+            ticketId: ticketRef.id,
+            orderId,
+            showId: order.showId,
+            sellingFrontId: order.sellingFrontId,
+            showTitle,
+            showStartDate,
+            emailHash: hashEmail(holderEmailNorm),
+            recipientEmail: holder.holderEmail,
+            recipientName: holder.holderName ?? null,
+            sharedByUid: order.buyerUid ?? null,
+            sharedByEmail: order.buyerSnapshot.email ?? null,
+            status: "pending",
+            source: "purchase",
+            createdAt: FieldValue.serverTimestamp(),
+            expiresAt: null,
+          });
+        }
       });
 
       tx.set(eventRef, {
@@ -402,6 +523,10 @@ async function issueTicketsForPaidOrder(
         eventId: event.id,
         error: error instanceof Error ? error.message : String(error),
       });
+    }
+
+    if (ticketReadyNotification) {
+      await sendTicketReadyNotification(ticketReadyNotification, event.id);
     }
   }
 
@@ -867,6 +992,7 @@ export const stripeWebhook = onRequest(
       STRIPE_SECRET_KEY,
       STRIPE_WEBHOOK_SECRET,
       PRIS_HOLLYWOOD_GROOVE_INTEGRATION_SECRET,
+      RESEND_API_KEY,
     ],
   },
   async (request, response) => {

@@ -10,6 +10,10 @@ export type RateLimitOptions = {
   keyPrefix?: string;
 };
 
+export type RequireAuthOptions = RateLimitOptions & {
+  requireEmailVerified?: boolean;
+};
+
 export type AuthenticatedCallableRequest<T = unknown> = CallableRequest<T> & {
   auth: NonNullable<CallableRequest<T>["auth"]>;
 };
@@ -100,7 +104,7 @@ export function getCustomClaims(token: Record<string, unknown>): Record<string, 
 export function requireAuth<T>(
   request: CallableRequest<T>,
   requiredRole: RequiredRole,
-  rateLimitOptions: RateLimitOptions = {}
+  options: RequireAuthOptions = {}
 ): AuthenticatedCallableRequest<T> {
   if (!request.auth) {
     throw new HttpsError("unauthenticated", "Firebase Auth is required.");
@@ -121,12 +125,22 @@ export function requireAuth<T>(
     logger.warn("Callable request missing App Check token", logPayload);
   }
 
-  enforceRateLimit(request.auth.uid, rateLimitOptions);
+  enforceRateLimit(request.auth.uid, options);
 
   if (requiredRole && !hasRequiredRole(request.auth.token, requiredRole)) {
     throw new HttpsError(
       "permission-denied",
       `Missing required role: ${formatRequiredRole(requiredRole)}.`
+    );
+  }
+
+  if (
+    options.requireEmailVerified === true &&
+    request.auth.token.email_verified !== true
+  ) {
+    throw new HttpsError(
+      "failed-precondition",
+      "Please verify your email before continuing."
     );
   }
 

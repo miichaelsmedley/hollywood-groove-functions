@@ -11,6 +11,7 @@ export const STRIPE_WEBHOOK_SECRET = defineSecret("STRIPE_WEBHOOK_SECRET");
 export const PRIS_HOLLYWOOD_GROOVE_INTEGRATION_SECRET = defineSecret(
   "PRIS_HOLLYWOOD_GROOVE_INTEGRATION_SECRET"
 );
+export const RESEND_API_KEY = defineSecret("RESEND_API_KEY");
 
 let stripeClient: ReturnType<typeof StripeClient> | null = null;
 
@@ -20,6 +21,36 @@ export function getTicketingDb() {
 
 export function getCheckoutBaseUrl(): string {
   return process.env.HG_CHECKOUT_BASE_URL || "https://app.hollywoodgroove.com.au";
+}
+
+export function getTicketWalletUrl(): string {
+  return `${getCheckoutBaseUrl()}/tickets`;
+}
+
+// Landing page for a shared-ticket invite. Unlike the wallet, this route shows
+// the event, prompts the recipient to sign in with the invited email, and then
+// claims the pending ticket into their wallet. The optional showId lets the
+// page render the event the recipient is being given a ticket to.
+export function getTicketClaimUrl(showId?: string): string {
+  const base = `${getCheckoutBaseUrl()}/tickets/claim`;
+  return showId ? `${base}?show=${encodeURIComponent(showId)}` : base;
+}
+
+// Continue URL for a passwordless email-link sign-in. The origin is fixed to our
+// own checkout domain (an Authorized Domain in Firebase Auth) — never taken from
+// the client — so a minted link can't be pointed at an attacker host. returnPath
+// is an optional in-app relative path the buyer lands on after sign-in completes.
+export function getAuthFinishUrl(returnPath?: string): string {
+  const base = `${getCheckoutBaseUrl()}/auth/finish`;
+  if (
+    typeof returnPath === "string" &&
+    returnPath.startsWith("/") &&
+    !returnPath.startsWith("//") &&
+    returnPath.length <= 512
+  ) {
+    return `${base}?return=${encodeURIComponent(returnPath)}`;
+  }
+  return base;
 }
 
 export function shouldUseMockStripeCheckout(): boolean {
@@ -60,6 +91,14 @@ export function getPrisIntegrationSecret(): string | null {
     "PRIS_HOLLYWOOD_GROOVE_INTEGRATION_SECRET",
     "HG_PRIS_INTEGRATION_SECRET",
   ]);
+}
+
+export function getResendApiKey(): string | null {
+  return readSecretValue(RESEND_API_KEY, ["RESEND_API_KEY", "HG_RESEND_API_KEY"]);
+}
+
+export function getEmailFromAddress(): string {
+  return process.env.HG_EMAIL_FROM || "Hollywood Groove <tickets@hollywoodgroove.com.au>";
 }
 
 function sanitizeStripeSecret(raw: string): string {

@@ -16,12 +16,79 @@ import { logger } from "firebase-functions/v2";
 import { onCall } from "firebase-functions/v2/https";
 import { createHash } from "node:crypto";
 import { requireAuth, REQUIRE_APP_CHECK } from "./lib/requireAuth";
-import { getTicketingDb, REGION } from "./ticketing/config";
+import {
+  getPrisApiBaseUrl,
+  getPrisIntegrationSecret,
+  getTicketingDb,
+  PRIS_HOLLYWOOD_GROOVE_INTEGRATION_SECRET,
+  REGION,
+} from "./ticketing/config";
 
 type VenueStaffRole = "door_staff" | "venue_manager";
+type TicketingUserRole =
+  | "none"
+  | "scanner"
+  | "ticketer"
+  | "ticket_admin"
+  | "absolute_admin";
 
 function hashEmail(email: string): string {
   return createHash("sha256").update(email.trim().toLowerCase()).digest("hex");
+}
+
+function ticketingRoleFromClaims(claims: Record<string, unknown>): TicketingUserRole {
+  if (claims.platform_admin === true) return "absolute_admin";
+  if (claims.event_admin === true) return "ticket_admin";
+  if (claims.venue_manager === true) return "ticketer";
+  if (claims.door_staff === true) return "scanner";
+  return "none";
+}
+
+async function syncPrisTicketingRole(params: {
+  targetUid: string;
+  email: string;
+  displayName?: string | null;
+  ticketingRole: TicketingUserRole;
+}): Promise<string | null> {
+  const secret = getPrisIntegrationSecret();
+  if (!secret) return "PRIS sync skipped (not configured)";
+  try {
+    const response = await fetch(
+      `${getPrisApiBaseUrl()}/api/integrations/hollywood-groove/ticketing-admins`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-PRIS-Integration-Secret": secret,
+        },
+        body: JSON.stringify({
+          email: params.email,
+          displayName: params.displayName || null,
+          firebaseUid: params.targetUid,
+          ticketing_role: params.ticketingRole,
+          actorUid: params.targetUid,
+          actorEmail: params.email,
+          source: "hollywood-groove-staff-invite-redemption",
+        }),
+      },
+    );
+    if (!response.ok) {
+      logger.warn("PRIS invite redemption role projection failed", {
+        email: params.email,
+        ticketingRole: params.ticketingRole,
+        status: response.status,
+      });
+      return `PRIS sync failed (${response.status})`;
+    }
+    return "PRIS user record updated";
+  } catch (error) {
+    logger.warn("PRIS invite redemption role projection request failed", {
+      email: params.email,
+      ticketingRole: params.ticketingRole,
+      reason: error instanceof Error ? error.message : "unknown_error",
+    });
+    return "PRIS sync failed";
+  }
 }
 
 interface RedeemedInvite {
@@ -31,7 +98,11 @@ interface RedeemedInvite {
 }
 
 export const claimMyPendingVenueStaffInvites = onCall(
-  { region: REGION, enforceAppCheck: REQUIRE_APP_CHECK },
+  {
+    region: REGION,
+    enforceAppCheck: REQUIRE_APP_CHECK,
+    secrets: [PRIS_HOLLYWOOD_GROOVE_INTEGRATION_SECRET],
+  },
   async (request) => {
     const authRequest = requireAuth(request, null, {
       keyPrefix: "claimMyPendingVenueStaffInvites",
@@ -120,6 +191,12 @@ export const claimMyPendingVenueStaffInvites = onCall(
         next[r] = true;
       });
       await admin.auth().setCustomUserClaims(targetUid, next);
+      await syncPrisTicketingRole({
+        targetUid,
+        email: callerEmail,
+        displayName: user.displayName || null,
+        ticketingRole: ticketingRoleFromClaims(next),
+      });
     }
 
     if (redeemed.length > 0) {

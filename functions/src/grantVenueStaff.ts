@@ -25,9 +25,21 @@ import { logger } from "firebase-functions/v2";
 import { HttpsError, CallableRequest, onCall } from "firebase-functions/v2/https";
 import { createHash } from "node:crypto";
 import { requireAuth, REQUIRE_APP_CHECK } from "./lib/requireAuth";
-import { getTicketingDb, REGION } from "./ticketing/config";
+import {
+  getPrisApiBaseUrl,
+  getPrisIntegrationSecret,
+  getTicketingDb,
+  PRIS_HOLLYWOOD_GROOVE_INTEGRATION_SECRET,
+  REGION,
+} from "./ticketing/config";
 
 type VenueStaffRole = "door_staff" | "venue_manager";
+type TicketingUserRole =
+  | "none"
+  | "scanner"
+  | "ticketer"
+  | "ticket_admin"
+  | "absolute_admin";
 
 const VENUE_STAFF_ROLES = new Set<VenueStaffRole>(["door_staff", "venue_manager"]);
 
@@ -60,6 +72,69 @@ function normalizeEmail(value: unknown): string | null {
   if (!text) return null;
   const lower = text.toLowerCase();
   return lower.includes("@") ? lower : null;
+}
+
+function ticketingRoleFromClaims(claims: Record<string, unknown>): TicketingUserRole {
+  if (claims.platform_admin === true) return "absolute_admin";
+  if (claims.event_admin === true) return "ticket_admin";
+  if (claims.venue_manager === true) return "ticketer";
+  if (claims.door_staff === true) return "scanner";
+  return "none";
+}
+
+async function syncPrisTicketingRole(params: {
+  targetUid: string;
+  email?: string | null;
+  displayName?: string | null;
+  ticketingRole: TicketingUserRole;
+  actorUid?: string | null;
+  actorEmail?: string | null;
+  source: string;
+}): Promise<string | null> {
+  const email = normalizeEmail(params.email);
+  if (!email) return "PRIS sync skipped (target email missing)";
+  const secret = getPrisIntegrationSecret();
+  if (!secret) return "PRIS sync skipped (not configured)";
+
+  try {
+    const response = await fetch(
+      `${getPrisApiBaseUrl()}/api/integrations/hollywood-groove/ticketing-admins`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-PRIS-Integration-Secret": secret,
+        },
+        body: JSON.stringify({
+          email,
+          displayName: params.displayName || null,
+          firebaseUid: params.targetUid,
+          ticketing_role: params.ticketingRole,
+          actorUid: params.actorUid || null,
+          actorEmail: params.actorEmail || null,
+          source: params.source,
+        }),
+      },
+    );
+    if (!response.ok) {
+      const raw = await response.text();
+      logger.warn("PRIS venue staff role projection failed", {
+        email,
+        ticketingRole: params.ticketingRole,
+        status: response.status,
+        reason: raw.slice(0, 160),
+      });
+      return `PRIS sync failed (${response.status})`;
+    }
+    return "PRIS user record updated";
+  } catch (error) {
+    logger.warn("PRIS venue staff role projection request failed", {
+      email,
+      ticketingRole: params.ticketingRole,
+      reason: error instanceof Error ? error.message : "unknown_error",
+    });
+    return "PRIS sync failed";
+  }
 }
 
 function hashEmail(email: string): string {
@@ -183,7 +258,11 @@ async function ensureCallerCanManageVenue(
   );
 }
 
-async function setClaim(targetUid: string, role: VenueStaffRole, grant: boolean): Promise<void> {
+async function setClaim(
+  targetUid: string,
+  role: VenueStaffRole,
+  grant: boolean,
+): Promise<admin.auth.UserRecord> {
   const user = await admin.auth().getUser(targetUid);
   const claims = { ...(user.customClaims ?? {}) };
   if (grant) {
@@ -193,6 +272,7 @@ async function setClaim(targetUid: string, role: VenueStaffRole, grant: boolean)
     // venue. revokeVenueStaff has its own logic to decide whether to strip.
   }
   await admin.auth().setCustomUserClaims(targetUid, claims);
+  return user;
 }
 
 async function stripClaimIfOrphaned(targetUid: string, role: VenueStaffRole): Promise<void> {
@@ -226,7 +306,11 @@ async function lookupUserByEmail(email: string): Promise<admin.auth.UserRecord |
 }
 
 export const grantVenueStaff = onCall(
-  { region: REGION, enforceAppCheck: REQUIRE_APP_CHECK },
+  {
+    region: REGION,
+    enforceAppCheck: REQUIRE_APP_CHECK,
+    secrets: [PRIS_HOLLYWOOD_GROOVE_INTEGRATION_SECRET],
+  },
   async (request) => {
     const partial = asRecord(request.data);
     try {
@@ -291,7 +375,7 @@ export const grantVenueStaff = onCall(
 
     if (targetUid) {
       // Direct grant: claim + eligibleStaff doc, atomic via batch.
-      await setClaim(targetUid, input.role, true);
+      const targetUser = await setClaim(targetUid, input.role, true);
 
       const staffRef = venueRef.collection("eligibleStaff").doc(targetUid);
       await staffRef.set({
@@ -324,11 +408,25 @@ export const grantVenueStaff = onCall(
         role: input.role,
         expiresAt: input.expiresAt,
       });
+      const prisNote = await syncPrisTicketingRole({
+        targetUid,
+        email: targetUser.email || targetEmail,
+        displayName: targetUser.displayName || null,
+        ticketingRole: ticketingRoleFromClaims({
+          ...(targetUser.customClaims ?? {}),
+          [input.role]: true,
+        }),
+        actorUid: request.auth?.uid || null,
+        actorEmail: typeof request.auth?.token.email === "string"
+          ? request.auth.token.email
+          : null,
+        source: "hollywood-groove-venue-staff",
+      });
       return {
         ok: true,
         outcome: "granted" as const,
         targetUid,
-        note: "claim takes effect after target's ID token refreshes",
+        note: `claim takes effect after target's ID token refreshes${prisNote ? `; ${prisNote}` : ""}`,
       };
     }
 
@@ -373,7 +471,11 @@ export const grantVenueStaff = onCall(
 );
 
 export const revokeVenueStaff = onCall(
-  { region: REGION, enforceAppCheck: REQUIRE_APP_CHECK },
+  {
+    region: REGION,
+    enforceAppCheck: REQUIRE_APP_CHECK,
+    secrets: [PRIS_HOLLYWOOD_GROOVE_INTEGRATION_SECRET],
+  },
   async (request) => {
     const partial = asRecord(request.data);
     try {
@@ -449,6 +551,18 @@ export const revokeVenueStaff = onCall(
 
       await staffRef.delete();
       await stripClaimIfOrphaned(input.targetUid, role);
+      const targetUser = await admin.auth().getUser(input.targetUid);
+      const prisNote = await syncPrisTicketingRole({
+        targetUid: input.targetUid,
+        email: targetUser.email || null,
+        displayName: targetUser.displayName || null,
+        ticketingRole: ticketingRoleFromClaims(targetUser.customClaims ?? {}),
+        actorUid: request.auth?.uid || null,
+        actorEmail: typeof request.auth?.token.email === "string"
+          ? request.auth.token.email
+          : null,
+        source: "hollywood-groove-venue-staff",
+      });
 
       await writeAuditLog({
         request,
@@ -457,7 +571,7 @@ export const revokeVenueStaff = onCall(
         details: { venueId: input.venueId, targetUid: input.targetUid, role },
       });
       logger.info("Venue staff revoked", { venueId: input.venueId, targetUid: input.targetUid, role });
-      return { ok: true, outcome: "revoked" as const };
+      return { ok: true, outcome: "revoked" as const, note: prisNote };
     }
 
     // Revoke a pending invite by the email it was sent to.

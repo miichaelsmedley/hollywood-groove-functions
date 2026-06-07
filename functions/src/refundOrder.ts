@@ -10,13 +10,24 @@ import { HttpsError, onCall } from "firebase-functions/v2/https";
 import { logger } from "firebase-functions/v2";
 import { requireAuth, REQUIRE_APP_CHECK } from "./lib/requireAuth";
 import {
+  getTicketWalletUrl,
   getStripeClient,
   getTicketingDb,
   REGION,
+  RESEND_API_KEY,
   shouldUseMockStripeCheckout,
   STRIPE_SECRET_KEY,
 } from "./ticketing/config";
-import { asRecord, nonEmptyString, TicketOrderData, TicketTypeData } from "./ticketing/shared";
+import { sendEmail } from "./lib/email/emailService";
+import { refundConfirmationEmail } from "./lib/email/templates";
+import {
+  asRecord,
+  nonEmptyString,
+  normaliseEmail,
+  TicketedShowData,
+  TicketOrderData,
+  TicketTypeData,
+} from "./ticketing/shared";
 
 type StripeRefundReason = "duplicate" | "fraudulent" | "requested_by_customer";
 type RefundStatus = "pending" | "succeeded" | "failed" | "cancelled";
@@ -93,6 +104,56 @@ function normaliseRefundStatus(status: unknown): RefundStatus {
   if (status === "failed") return "failed";
   if (status === "canceled" || status === "cancelled") return "cancelled";
   return "pending";
+}
+
+function formatAudAmount(amountCents: number): string {
+  return `AUD ${(amountCents / 100).toLocaleString("en-AU", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })}`;
+}
+
+async function sendRefundConfirmation(params: {
+  orderId: string;
+  amountCents: number;
+}): Promise<void> {
+  try {
+    const db = getTicketingDb();
+    const orderSnap = await db.collection("orders").doc(params.orderId).get();
+    if (!orderSnap.exists) {
+      return;
+    }
+
+    const order = orderSnap.data() as TicketOrderData;
+    const buyerEmail = normaliseEmail(order.buyerSnapshot.email);
+    if (!buyerEmail) {
+      return;
+    }
+
+    const showSnap = await db.collection("shows").doc(order.showId).get();
+    const show = showSnap.exists
+      ? (showSnap.data() as TicketedShowData)
+      : null;
+    const template = refundConfirmationEmail({
+      sellingFrontId: order.sellingFrontId,
+      buyerName: order.buyerSnapshot.displayName ?? null,
+      showTitle: show?.title || order.lineItems[0]?.name || "your show",
+      amountText: formatAudAmount(params.amountCents),
+      walletUrl: getTicketWalletUrl(),
+    });
+
+    await sendEmail({
+      to: buyerEmail,
+      subject: template.subject,
+      html: template.html,
+      text: template.text,
+    });
+  } catch (error) {
+    logger.warn("Refund confirmation email failed", {
+      orderId: params.orderId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
 }
 
 async function createPendingRefund(params: {
@@ -378,6 +439,13 @@ export async function refundPaidOrderAsAdmin(params: {
     actorUid: params.actorUid,
   });
 
+  if (stripeRefund.status !== "failed" && stripeRefund.status !== "cancelled") {
+    await sendRefundConfirmation({
+      orderId: pending.orderId,
+      amountCents: pending.amountCents,
+    });
+  }
+
   return {
     ok: true,
     refundId: pending.refundId,
@@ -394,13 +462,14 @@ export const refundOrder = onCall(
   {
     region: REGION,
     enforceAppCheck: REQUIRE_APP_CHECK,
-    secrets: [STRIPE_SECRET_KEY],
+    secrets: [STRIPE_SECRET_KEY, RESEND_API_KEY],
   },
   async (request): Promise<RefundOrderResult> => {
     const authRequest = requireAuth(request, ["platform_admin", "event_admin"], {
       keyPrefix: "refundOrder",
       maxCalls: 10,
       windowMs: 60 * 1000,
+      requireEmailVerified: true,
     });
 
     return refundPaidOrderAsAdmin({

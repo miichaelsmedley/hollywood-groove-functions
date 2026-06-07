@@ -490,7 +490,15 @@ async function createTicketedShowForPrisGig(
       nonNegativeInteger(existingTicketType.quantityReserved)
     : 0;
   const safeQuantity = Math.max(quantity, committedQuantity);
-  const maxPerOrder = Math.min(10, safeQuantity);
+  // New ticket types default to this per-order cap. Admins can raise or lower it
+  // per show in /admin/ticketing afterwards; that edit is preserved across PRIS
+  // re-syncs because we only set maxPerOrder when first creating the ticket type
+  // (below), never on update.
+  const DEFAULT_MAX_PER_ORDER = 20;
+  const newTicketTypeMaxPerOrder = Math.max(
+    1,
+    Math.min(DEFAULT_MAX_PER_ORDER, safeQuantity),
+  );
   if (safeQuantity !== quantity) {
     logger.warn("Preserved committed ticket inventory above PRIS quantity", {
       showId,
@@ -569,7 +577,6 @@ async function createTicketedShowForPrisGig(
     quantityTotal: safeQuantity,
     saleStartAt: FieldValue.serverTimestamp(),
     saleEndAt: startDate,
-    maxPerOrder,
     active: true,
     displayOrder: 1,
     updatedAt: FieldValue.serverTimestamp(),
@@ -577,6 +584,9 @@ async function createTicketedShowForPrisGig(
   if (!ttExisting.exists) {
     ttPayload.quantitySold = 0;
     ttPayload.quantityReserved = 0;
+    // Only set the per-order cap on creation so a later admin edit survives
+    // PRIS re-syncs (mirrors how sold/reserved are preserved above).
+    ttPayload.maxPerOrder = newTicketTypeMaxPerOrder;
     ttPayload.createdAt = FieldValue.serverTimestamp();
   }
   await ttRef.set(ttPayload, { merge: true });

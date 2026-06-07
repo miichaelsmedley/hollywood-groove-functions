@@ -33,6 +33,7 @@ type AuthenticatedBuyer = {
   uid: string;
   email?: string | null;
   displayName?: string | null;
+  emailVerified?: boolean;
 };
 
 type CheckoutSessionResult = {
@@ -550,6 +551,7 @@ export async function createCheckoutSessionForAuthenticatedUser(params: {
       sellingFrontId: show.sellingFrontId,
       buyerUid: params.buyer.uid,
       buyerSnapshot: input.buyerSnapshot,
+      buyerEmailVerified: params.buyer.emailVerified === true,
       status: "pending",
       lineItems: [
         {
@@ -656,6 +658,10 @@ export const createCheckoutSession = onCall(
     secrets: [STRIPE_SECRET_KEY],
   },
   async (request) => {
+    // Guest checkout: a signed-in account is NOT required to buy. We still
+    // require Firebase Auth (anonymous is fine) + App Check + rate limiting for
+    // abuse protection; the buyer's email comes from the checkout form. Buyers
+    // sign in AFTER paying to claim their ticket (see claimMyPendingTickets).
     const authRequest = requireAuth(request, null, {
       keyPrefix: "createCheckoutSession",
       maxCalls: 10,
@@ -673,6 +679,7 @@ export const createCheckoutSession = onCall(
           typeof authRequest.auth.token.name === "string"
             ? authRequest.auth.token.name
             : null,
+        emailVerified: authRequest.auth.token.email_verified === true,
       },
       data: request.data,
     });

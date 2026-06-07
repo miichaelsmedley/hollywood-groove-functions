@@ -8,9 +8,9 @@ export { triviaScoring, triviaScoringTest } from "./scoring/triviaScoring";
 export { dancingScoring, dancingScoringTest } from "./scoring/dancingScoring";
 export { allTimeLeaderboard, allTimeLeaderboardTest } from "./scoring/allTimeLeaderboard";
 export { teamScoring, teamScoringTest } from "./scoring/teamScoring";
-export { dailyTriviaAutoScheduler } from "./scheduling/dailyTriviaScheduler";
+export { dailyTriviaAutoScheduler, dailyTriviaEngagementAutopilot } from "./scheduling/dailyTriviaScheduler";
 export { whoAmI } from "./whoAmI";
-export { setAdminClaim } from "./setAdminClaim";
+export { setAdminClaim, syncTicketingAdminFromPrisUser } from "./setAdminClaim";
 export { createCheckoutSession } from "./createCheckoutSession";
 export { stripeWebhook } from "./stripeWebhook";
 export { expireReservations } from "./expireReservations";
@@ -20,6 +20,9 @@ export { claimMyPendingVenueStaffInvites } from "./claimVenueStaffInvites";
 export { validateTicketScan } from "./validateTicketScan";
 export { refundOrder } from "./refundOrder";
 export { issueCompTicket } from "./issueCompTicket";
+export { shareTicket } from "./shareTicket";
+export { claimMyPendingTickets } from "./claimMyPendingTickets";
+export { sendEmailSignInLink } from "./sendEmailSignInLink";
 export { searchPrisVenues, importPrisVenue } from "./importPrisVenue";
 export {
   createTicketedShowFromGig,
