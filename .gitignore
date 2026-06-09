@@ -3,4 +3,4 @@ functions/lib/
 .firebase/
 *.log
 .env
-
+.DS_Store
