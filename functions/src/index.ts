@@ -12,6 +12,8 @@ export { dailyTriviaAutoScheduler, dailyTriviaEngagementAutopilot } from "./sche
 export { whoAmI } from "./whoAmI";
 export { setAdminClaim, syncTicketingAdminFromPrisUser } from "./setAdminClaim";
 export { createCheckoutSession } from "./createCheckoutSession";
+export { checkDisplayNameAvailable } from "./checkDisplayNameAvailable";
+export { mirrorShowMetaToIndex, mirrorTestShowMetaToIndex } from "./showIndex";
 export { stripeWebhook } from "./stripeWebhook";
 export { expireReservations } from "./expireReservations";
 export { grantVenueStaff, revokeVenueStaff } from "./grantVenueStaff";
