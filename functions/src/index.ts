@@ -6,8 +6,30 @@ if (admin.apps.length === 0) {
 
 export { triviaScoring, triviaScoringTest } from "./scoring/triviaScoring";
 export { dancingScoring, dancingScoringTest } from "./scoring/dancingScoring";
+export {
+  danceWindowOpenedScoring,
+  danceWindowOpenedScoringTest,
+  dancePresenceScoring,
+  dancePresenceScoringTest,
+  danceWindowSpotlightScoring,
+  danceWindowSpotlightScoringTest,
+} from "./scoring/danceWindows";
 export { allTimeLeaderboard, allTimeLeaderboardTest } from "./scoring/allTimeLeaderboard";
 export { teamScoring, teamScoringTest } from "./scoring/teamScoring";
+export {
+  setWinnerFinalizer,
+  setWinnerFinalizerTest,
+  nightWinnerFinalizer,
+  nightWinnerFinalizerTest,
+} from "./scoring/showResults";
+export {
+  claimOffer,
+  redeemOfferClaim,
+  setWinnerOfferAwarder,
+  setWinnerOfferAwarderTest,
+  nightWinnerOfferAwarder,
+  nightWinnerOfferAwarderTest,
+} from "./offers";
 export { dailyTriviaAutoScheduler, dailyTriviaEngagementAutopilot } from "./scheduling/dailyTriviaScheduler";
 export { whoAmI } from "./whoAmI";
 export { setAdminClaim, syncTicketingAdminFromPrisUser } from "./setAdminClaim";

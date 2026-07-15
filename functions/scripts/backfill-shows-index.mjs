@@ -5,8 +5,13 @@ const PROJECT_ID =
   process.env.GOOGLE_CLOUD_PROJECT ||
   "theta-inkwell-448908-g9";
 
+// The Admin SDK cannot infer the RTDB instance outside GCP.
+const DATABASE_URL =
+  process.env.FIREBASE_DATABASE_URL ||
+  "https://theta-inkwell-448908-g9-default-rtdb.asia-southeast1.firebasedatabase.app";
+
 if (admin.apps.length === 0) {
-  admin.initializeApp({ projectId: PROJECT_ID });
+  admin.initializeApp({ projectId: PROJECT_ID, databaseURL: DATABASE_URL });
 }
 
 const db = admin.database();

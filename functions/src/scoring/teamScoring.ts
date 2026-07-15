@@ -2,6 +2,7 @@ import * as admin from "firebase-admin";
 import { onValueWritten, DataSnapshot, DatabaseEvent } from "firebase-functions/v2/database";
 import { Change } from "firebase-functions/common";
 import { logger } from "firebase-functions/v2";
+import { scheduleDebouncedLeaderboardRebuild } from "./leaderboardDebounce";
 
 /**
  * Team Scoring Cloud Function
@@ -195,8 +196,15 @@ function makeTeamScoring(namespacePrefix: string) {
         namespacePrefix: normalizedPrefix,
       });
 
-      // 7. Update team leaderboard for this show
-      await updateTeamLeaderboard(database, showId, root);
+      // 7. Coalesce team leaderboard rebuilds across score bursts.
+      await scheduleDebouncedLeaderboardRebuild({
+        database,
+        showId,
+        root,
+        kind: "team_leaderboard",
+        reason: "team_score",
+        rebuild: () => updateTeamLeaderboard(database, showId, root),
+      });
 
       return null;
     }

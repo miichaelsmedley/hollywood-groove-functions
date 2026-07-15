@@ -1,6 +1,6 @@
 {
   "name": "hollywood-groove-functions",
-  "version": "1.6.0",
+  "version": "1.10.0",
   "description": "Firebase Cloud Functions for Hollywood Groove scoring and engagement",
   "main": "lib/index.js",
   "scripts": {

@@ -2,7 +2,9 @@ import * as admin from "firebase-admin";
 import { onValueWritten, DataSnapshot, DatabaseEvent } from "firebase-functions/v2/database";
 import { Change } from "firebase-functions/common";
 import { logger } from "firebase-functions/v2";
+import { rebuildScoresLeaderboard, scheduleDebouncedLeaderboardRebuild } from "./leaderboardDebounce";
 import { isTriviaResponsePayload, type TriviaResponseContract } from "./responseContracts";
+import { applySetScoreDelta, resolveSetNumberForScore } from "./setScoring";
 
 type TriviaResponse = TriviaResponseContract;
 
@@ -14,6 +16,7 @@ type TriviaPrivateActivity = {
 };
 
 type TriviaPublicActivity = {
+  setNumber?: number | null;
   trivia?: {
     question?: string;
     kind?: string;
@@ -23,6 +26,12 @@ type TriviaPublicActivity = {
       step?: number;
     };
   };
+};
+
+type LiveTriviaState = {
+  activityId?: string | null;
+  startedAt?: number | null;
+  durationSeconds?: number | null;
 };
 
 type ShowSettings = {
@@ -57,6 +66,12 @@ function clamp01(value: number): number {
   if (value < 0) return 0;
   if (value > 1) return 1;
   return value;
+}
+
+function timestampFromEventTime(eventTime: string | undefined): number | null {
+  if (!eventTime) return null;
+  const timestamp = Date.parse(eventTime);
+  return Number.isFinite(timestamp) ? timestamp : null;
 }
 
 function normaliseAnswer(text: string): string {
@@ -218,12 +233,13 @@ function makeTriviaScoring(namespacePrefix: string) {
 
     const database = admin.database();
 
-    const [existingResultSnap, privateSnap, settingsSnap, attendeeSnap, activitySnap] = await Promise.all([
+    const [existingResultSnap, privateSnap, settingsSnap, attendeeSnap, activitySnap, liveTriviaSnap] = await Promise.all([
       database.ref(showPath(showId, `results/${activityId}/${odience}`)).get(),
       database.ref(showPath(showId, `activities_private/${activityId}`)).get(),
       database.ref(showPath(showId, "settings")).get(),
       database.ref(showPath(showId, `attendees/${odience}`)).get(),
       database.ref(showPath(showId, `activities/${activityId}`)).get(),
+      database.ref(showPath(showId, "live/trivia")).get(),
     ]);
 
     // Idempotency guard: if a result already exists for this user+activity, do not apply scoring again.
@@ -233,6 +249,7 @@ function makeTriviaScoring(namespacePrefix: string) {
 
     const privateActivity = privateSnap.val() as TriviaPrivateActivity | null;
     const publicActivity = activitySnap.val() as TriviaPublicActivity | null;
+    const liveTrivia = liveTriviaSnap.val() as LiveTriviaState | null;
     const correctOptionIndex = privateActivity?.trivia?.correctOptionIndex;
 
     const settings = settingsSnap.val() as ShowSettings | null;
@@ -249,12 +266,19 @@ function makeTriviaScoring(namespacePrefix: string) {
     let affectsStreak = false;
     let allowPartialScore = false;
 
-    const answeredAt = numberOrDefault(response.answeredAt, Date.now());
-
-    const responseTimeMs = typeof response.responseTime === "number" ? response.responseTime : null;
-    const elapsedMs = responseTimeMs ?? timeLimitMs;
-    const clampedElapsedMs = Math.min(Math.max(elapsedMs, 0), timeLimitMs);
-    const speedFactor = clamp01(1 - clampedElapsedMs / timeLimitMs);
+    const eventTime = (event as { time?: string }).time;
+    const answeredAt = timestampFromEventTime(eventTime) ?? Date.now();
+    const liveDurationSeconds = numberOrDefault(liveTrivia?.durationSeconds, timeLimitSeconds);
+    const scoringWindowMs = Math.max(0, liveDurationSeconds) * 1000 || timeLimitMs;
+    const hasMatchingLiveTrivia =
+      liveTrivia?.activityId === activityId &&
+      typeof liveTrivia.startedAt === "number" &&
+      Number.isFinite(liveTrivia.startedAt);
+    const elapsedMs = hasMatchingLiveTrivia
+      ? answeredAt - (liveTrivia.startedAt as number)
+      : scoringWindowMs;
+    const clampedElapsedMs = Math.min(Math.max(elapsedMs, 0), scoringWindowMs);
+    const speedFactor = clamp01(1 - clampedElapsedMs / scoringWindowMs);
 
     if (hasChoice) {
       const resolvedIndex = optionIndexRaw ?? (booleanValue ? 0 : 1);
@@ -345,6 +369,7 @@ function makeTriviaScoring(namespacePrefix: string) {
     await database.ref(showPath(showId, `scores/${odience}`)).transaction((current) => {
       const existing = (current ?? {}) as Record<string, any>;
       const existingTotal = intOrDefault(existing.totalScore, 0);
+      const nextTotal = existingTotal + totalScore;
       const existingCorrectCount = intOrDefault(existing.correctCount, 0);
 
       const breakdown = (existing.breakdown ?? {}) as Record<string, any>;
@@ -354,7 +379,7 @@ function makeTriviaScoring(namespacePrefix: string) {
         ...existing,
         displayName: existing.displayName ?? displayName,
         tier: existing.tier ?? tier,
-        totalScore: existingTotal + totalScore,
+        totalScore: nextTotal,
         breakdown: {
           ...breakdown,
           trivia: triviaBreakdown + totalScore,
@@ -362,31 +387,43 @@ function makeTriviaScoring(namespacePrefix: string) {
         correctCount: existingCorrectCount + (isCorrect ? 1 : 0),
         currentStreak: nextStreak,
         lastAnsweredAt: answeredAt,
+        scoreReachedAt: nextTotal > existingTotal ? answeredAt : existing.scoreReachedAt ?? null,
       };
     });
 
-    // 4) Rebuild leaderboard (top 50)
-    const scoresSnap = await database
-      .ref(showPath(showId, "scores"))
-      .orderByChild("totalScore")
-      .limitToLast(50)
-      .get();
-
-    const scoresValue = (scoresSnap.val() as Record<string, any> | null) ?? {};
-    const top = Object.entries(scoresValue)
-      .map(([uid, score]) => ({
-        uid,
-        displayName: (score as any)?.displayName ?? "Guest",
-        totalScore: intOrDefault((score as any)?.totalScore, 0),
-        tier: (score as any)?.tier ?? null,
-      }))
-      .sort((a, b) => b.totalScore - a.totalScore)
-      .slice(0, 50);
-
-    await database.ref(showPath(showId, "leaderboard")).set({
-      updatedAt: admin.database.ServerValue.TIMESTAMP,
-      top,
+    const setNumber = await resolveSetNumberForScore({
+      database,
+      showId,
+      root,
+      activity: publicActivity,
+      scoredAt: answeredAt,
     });
+
+    // 4) Update set tally and coalesce leaderboard rebuilds across the response burst.
+    await Promise.all([
+      applySetScoreDelta({
+        database,
+        showId,
+        root,
+        setNumber,
+        uid: odience,
+        displayName,
+        tier,
+        category: "trivia",
+        scoreDelta: totalScore,
+        scoredAt: answeredAt,
+        correctIncrement: isCorrect ? 1 : 0,
+        currentStreak: nextStreak,
+      }),
+      scheduleDebouncedLeaderboardRebuild({
+        database,
+        showId,
+        root,
+        kind: "leaderboard",
+        reason: "trivia_score",
+        rebuild: () => rebuildScoresLeaderboard(database, showId, root),
+      }),
+    ]);
 
     return null;
     }

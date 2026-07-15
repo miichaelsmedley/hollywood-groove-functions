@@ -2,7 +2,9 @@ import * as admin from "firebase-admin";
 import { onValueWritten, DataSnapshot, DatabaseEvent } from "firebase-functions/v2/database";
 import { Change } from "firebase-functions/common";
 import { logger } from "firebase-functions/v2";
+import { rebuildScoresLeaderboard, scheduleDebouncedLeaderboardRebuild } from "./leaderboardDebounce";
 import { isDanceClaimResponse, type DanceClaimResponseContract } from "./responseContracts";
+import { applySetScoreDelta, resolveSetNumberForScore } from "./setScoring";
 
 type DanceClaimResponse = DanceClaimResponseContract;
 
@@ -32,6 +34,10 @@ type LiveActivity = {
   type?: string | null;
   status?: string | null;
   startedAt?: number | null;
+};
+
+type PublicActivity = {
+  setNumber?: number | null;
 };
 
 function numberOrDefault(value: unknown, defaultValue: number): number {
@@ -108,16 +114,18 @@ function makeDancingScoring(namespacePrefix: string) {
 
       const database = admin.database();
 
-      const [settingsSnap, attendeeSnap, scoresSnap, liveActivitySnap] = await Promise.all([
+      const [settingsSnap, attendeeSnap, scoresSnap, liveActivitySnap, activitySnap] = await Promise.all([
         database.ref(showPath(showId, "settings")).get(),
         database.ref(showPath(showId, `attendees/${odience}`)).get(),
         database.ref(showPath(showId, "scores")).get(),
         database.ref(showPath(showId, "live/activity")).get(),
+        database.ref(showPath(showId, `activities/${activityId}`)).get(),
       ]);
 
       const settings = settingsSnap.val() as ShowSettings | null;
       const attendee = attendeeSnap.val() as AttendeeRecord | null;
       const liveActivity = liveActivitySnap.val() as LiveActivity | null;
+      const publicActivity = activitySnap.val() as PublicActivity | null;
 
       const mode = settings?.dancing_mode ?? "per_song";
       if (mode === "disabled") {
@@ -191,6 +199,7 @@ function makeDancingScoring(namespacePrefix: string) {
       await database.ref(showPath(showId, `scores/${odience}`)).transaction((current) => {
         const existing = (current ?? {}) as Record<string, any>;
         const existingTotal = intOrDefault(existing.totalScore, 0);
+        const nextTotal = existingTotal + awardedPoints;
 
         const breakdown = (existing.breakdown ?? {}) as Record<string, any>;
         const dancingBreakdown = intOrDefault(breakdown.dancing, 0);
@@ -199,12 +208,13 @@ function makeDancingScoring(namespacePrefix: string) {
           ...existing,
           displayName: existing.displayName ?? displayName,
           tier: existing.tier ?? tier,
-          totalScore: existingTotal + awardedPoints,
+          totalScore: nextTotal,
           breakdown: {
             ...breakdown,
             dancing: dancingBreakdown + awardedPoints,
           },
           lastAnsweredAt: claimedAt,
+          scoreReachedAt: nextTotal > existingTotal ? claimedAt : existing.scoreReachedAt ?? null,
         };
       });
 
@@ -212,27 +222,36 @@ function makeDancingScoring(namespacePrefix: string) {
         await database.ref(showPath(showId, "live/activity/currentMedian")).set(awardedPoints);
       }
 
-      const leaderboardSnap = await database
-        .ref(showPath(showId, "scores"))
-        .orderByChild("totalScore")
-        .limitToLast(50)
-        .get();
-
-      const leaderboardValue = (leaderboardSnap.val() as Record<string, any> | null) ?? {};
-      const top = Object.entries(leaderboardValue)
-        .map(([uid, score]) => ({
-          uid,
-          displayName: (score as any)?.displayName ?? "Guest",
-          totalScore: intOrDefault((score as any)?.totalScore, 0),
-          tier: (score as any)?.tier ?? null,
-        }))
-        .sort((a, b) => b.totalScore - a.totalScore)
-        .slice(0, 50);
-
-      await database.ref(showPath(showId, "leaderboard")).set({
-        updatedAt: admin.database.ServerValue.TIMESTAMP,
-        top,
+      const setNumber = await resolveSetNumberForScore({
+        database,
+        showId,
+        root,
+        activity: publicActivity,
+        scoredAt: claimedAt,
       });
+
+      await Promise.all([
+        applySetScoreDelta({
+          database,
+          showId,
+          root,
+          setNumber,
+          uid: odience,
+          displayName,
+          tier,
+          category: "dancing",
+          scoreDelta: awardedPoints,
+          scoredAt: claimedAt,
+        }),
+        scheduleDebouncedLeaderboardRebuild({
+          database,
+          showId,
+          root,
+          kind: "leaderboard",
+          reason: "dancing_score",
+          rebuild: () => rebuildScoresLeaderboard(database, showId, root),
+        }),
+      ]);
 
       logger.info("Dancing scored", {
         showId,
